@@ -1289,7 +1289,10 @@ async def _process_runtime_mentions(session: AmplifierSession, prompt: str) -> N
         await context.add_message(msg_dict)
 
 
-def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSession:
+def _create_prompt_session(
+    get_active_mode: Callable | None = None,
+    bottom_toolbar: Callable | None = None,
+) -> PromptSession:
     """Create configured PromptSession for REPL.
 
     Provides:
@@ -1299,9 +1302,11 @@ def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSes
     - History search with Ctrl-R
     - Multi-line input with Ctrl-J
     - Graceful fallback to in-memory history on errors
+    - Optional bottom toolbar (e.g. from streaming-ui StatusBarProvider)
 
     Args:
         get_active_mode: Optional callable that returns the current active mode name
+        bottom_toolbar: Optional callable returning toolbar text (re-evaluated each render)
 
     Returns:
         Configured PromptSession instance
@@ -1362,6 +1367,7 @@ def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSes
         multiline=True,  # Enable multi-line display
         prompt_continuation="  ",  # Two spaces for alignment (cleaner than "... ")
         enable_history_search=True,  # Enables Ctrl-R
+        bottom_toolbar=bottom_toolbar,
     )
 
 
@@ -1436,11 +1442,15 @@ async def interactive_chat(
             )
         )
 
+    # Get status bar from streaming-ui hooks (if available)
+    status_bar = session.coordinator.get_capability("status_bar")
+
     # Create prompt session for history and advanced editing
     prompt_session = _create_prompt_session(
         get_active_mode=lambda: command_processor.session.coordinator.session_state.get(
             "active_mode"
-        )
+        ),
+        bottom_toolbar=status_bar.format_toolbar if status_bar else None,
     )
 
     # Helper to extract model name from config
