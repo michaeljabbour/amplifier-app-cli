@@ -1350,15 +1350,21 @@ def _create_prompt_session(
         """Submit input on Enter."""
         event.current_buffer.validate_and_handle()
 
-    # Dynamic prompt that shows [mode] indicator when a mode is active
+    # Dynamic prompt with thin separator bar and optional [mode] indicator
     def get_prompt():
+        import shutil
+
+        cols = shutil.get_terminal_size().columns
+        sep = "\u2500" * cols  # thin horizontal line
+        mode_prefix = ""
         if get_active_mode:
             active_mode = get_active_mode()
             if active_mode:
-                return HTML(
-                    f"\n<ansicyan>[{active_mode}]</ansicyan><ansigreen><b>></b></ansigreen> "
-                )
-        return HTML("\n<ansigreen><b>></b></ansigreen> ")
+                mode_prefix = f"<ansicyan>[{active_mode}]</ansicyan>"
+        return HTML(
+            f"\n<style fg='#555555'>{sep}</style>\n"
+            f"{mode_prefix}<ansigreen><b>></b></ansigreen> "
+        )
 
     return PromptSession(
         message=get_prompt,  # Callable for dynamic prompt
