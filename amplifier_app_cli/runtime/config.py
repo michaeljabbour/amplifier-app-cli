@@ -609,6 +609,36 @@ def _apply_provider_overrides(
     return result
 
 
+def resume_credential_overrides(
+    providers: list[dict[str, Any]], overrides: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Restore legacy unnamed instances only when current credentials agree.
+
+    Splitting a default provider into named profiles changes the settings key,
+    but existing delegates still carry the module-keyed, redacted snapshot.
+    Exact identity matches keep precedence. Never guess across distinct keys or
+    endpoints, and never use this migration for an explicitly named instance.
+    """
+    narrowed = narrow_overrides_to_secrets(overrides)
+    exact = {item.get("id") or item["module"] for item in narrowed}
+    for provider in providers:
+        module = provider.get("module")
+        if not module or provider.get("id") or provider.get("instance_id") or module in exact:
+            continue
+        candidates = [item for item in narrowed if item["module"] == module]
+        if not candidates or any(item["config"] != candidates[0]["config"] for item in candidates):
+            continue
+        # Preserve the persisted endpoint, and only restore credentials when
+        # every live profile still describes that same route.
+        endpoint = provider.get("config", {}).get("base_url") or None
+        live = [item for item in overrides if item.get("module") == module]
+        if any((expand_env_vars(item).get("config", {}).get("base_url") or None) != endpoint for item in live):
+            continue
+        narrowed.append({"module": module, "config": candidates[0]["config"]})
+        exact.add(module)
+    return narrowed
+
+
 def _prune_to_secret_keys(value: Any) -> Any | None:
     """Return a copy of ``value`` keeping ONLY secret-bearing branches.
 

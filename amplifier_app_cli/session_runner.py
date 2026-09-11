@@ -679,6 +679,7 @@ def register_session_spawning(
         return await resume_sub_session(
             sub_session_id=sub_session_id,
             instruction=instruction,
+            parent_session=session,
             provider_preferences=provider_preferences,
             model_role=model_role,
         )

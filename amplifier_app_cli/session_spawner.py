@@ -499,6 +499,27 @@ def _open_partial(sub_session_id: str, hooks):
 _DEFAULT_SYS_PATHS: frozenset[str] = frozenset(sys.path)
 
 
+def _extract_mention_mappings(resolver: Any) -> dict[str, str]:
+    """Read namespaces from Foundation resolvers and the CLI wrapper."""
+    mappings: dict[str, str] = {}
+    seen: set[int] = set()
+    while resolver is not None and id(resolver) not in seen:
+        seen.add(id(resolver))
+        direct = getattr(resolver, "_bundle_mappings", None)
+        if isinstance(direct, dict):
+            for name, path in direct.items():
+                if path is not None:
+                    mappings[name] = str(path)
+        bundles = getattr(resolver, "bundles", None)
+        if isinstance(bundles, dict):
+            for name, bundle in bundles.items():
+                path = getattr(bundle, "base_path", None)
+                if path is not None:
+                    mappings[name] = str(path)
+        resolver = getattr(resolver, "__dict__", {}).get("foundation_resolver")
+    return mappings
+
+
 def _extract_bundle_context(session: "AmplifierSession") -> dict | None:
     """Extract serializable bundle context from session.
 
@@ -513,8 +534,6 @@ def _extract_bundle_context(session: "AmplifierSession") -> dict | None:
     """
     # Get module resolver
     resolver = session.coordinator.get("module-source-resolver")
-    if resolver is None:
-        return None
 
     # Extract module paths from resolver
     # Handle both AppModuleResolver (wraps _bundle) and BundleModuleResolver directly
@@ -527,17 +546,11 @@ def _extract_bundle_context(session: "AmplifierSession") -> dict | None:
         # Direct BundleModuleResolver
         module_paths = {k: str(v) for k, v in resolver._paths.items()}
 
-    if not module_paths:
-        # Not bundle mode - no paths to preserve
-        return None
-
     # Extract mention mappings from mention resolver (for @namespace:path resolution)
-    mention_mappings: dict[str, str] = {}
     mention_resolver = session.coordinator.get_capability("mention_resolver")
-    if mention_resolver and hasattr(mention_resolver, "_bundle_mappings"):
-        mention_mappings = {
-            k: str(v) for k, v in mention_resolver._bundle_mappings.items()
-        }
+    mention_mappings = _extract_mention_mappings(mention_resolver)
+    if not module_paths and not mention_mappings:
+        return None
 
     return {
         "module_paths": module_paths,
@@ -1847,7 +1860,7 @@ async def resume_sub_session(
             _map_id_to_instance_id,
             deep_merge,
             expand_env_vars,
-            narrow_overrides_to_secrets,
+            resume_credential_overrides,
         )
 
         _live_settings = AppSettings()
@@ -1869,8 +1882,8 @@ async def resume_sub_session(
             #
             # Only the keys that redact_secrets() actually redacted need
             # restoring here, so only those are allowed through.
-            _live_provider_overrides = narrow_overrides_to_secrets(
-                _live_settings.get_provider_overrides()
+            _live_provider_overrides = resume_credential_overrides(
+                merged_config["providers"], _live_settings.get_provider_overrides()
             )
             if _live_provider_overrides:
                 _refreshed_providers = _apply_provider_overrides(
@@ -2149,10 +2162,6 @@ async def resume_sub_session(
         "session.working_dir", _child_resume_working_dir
     )
 
-    # Initialize session (mounts modules per config)
-    # Now the resolver is available for loading modules with source: directives
-    await child_session.initialize()
-
     # Mention resolver - restore bundle mappings if available
     if bundle_context and bundle_context.get("mention_mappings"):
         # Restore AppMentionResolver with saved bundle mappings for @namespace:path resolution
@@ -2166,6 +2175,11 @@ async def resume_sub_session(
         logger.debug(
             f"Restored AppMentionResolver with {len(mention_mappings)} bundle mappings"
         )
+    elif parent_session is not None and (
+        parent_mentions := parent_session.coordinator.get_capability("mention_resolver")
+    ):
+        # Older snapshots omitted Foundation's namespace registry entirely.
+        child_session.coordinator.register_capability("mention_resolver", parent_mentions)
     else:
         # Fallback to fresh resolver without bundle mappings
         child_session.coordinator.register_capability(
@@ -2176,6 +2190,10 @@ async def resume_sub_session(
     child_session.coordinator.register_capability(
         "mention_deduplicator", ContentDeduplicator()
     )
+
+    # Skills resolve @namespace:skills while modules initialize, before the
+    # first provider request. Both mention capabilities must already exist.
+    await child_session.initialize()
 
     # Self-delegation depth - restore from metadata for recursion limit tracking
     self_delegation_depth = metadata.get("self_delegation_depth", 0)
