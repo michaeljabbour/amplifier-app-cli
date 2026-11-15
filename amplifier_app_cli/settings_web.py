@@ -268,8 +268,16 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
                 "Reload to see the current settings.",
             )
         doc = cast(dict[str, Any], doc)
-        moved = secure_literal_secrets(settings, doc, scope)
-        settings._write_scope(scope, doc)
+        from . import provider_config_utils
+
+        # its "could not resolve provider module" warnings would print to the
+        # terminal on every save; the page reports problems itself
+        quiet, provider_config_utils.console.quiet = provider_config_utils.console.quiet, True
+        try:
+            moved = secure_literal_secrets(settings, doc, scope)
+            settings._write_scope(scope, doc)
+        finally:
+            provider_config_utils.console.quiet = quiet
     server.routing.refresh()  # providers may have changed: re-check model lists
     return {**build_state(settings, server.routing), "moved_keys": moved}
 

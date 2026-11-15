@@ -13,9 +13,11 @@ from __future__ import annotations
 import concurrent.futures
 import copy
 import datetime
+import logging
 import os
 import re
 import threading
+import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -191,10 +193,27 @@ class RoutingService:
     def models(self, provider: str) -> dict[str, Any]:
         from .provider_loader import ModelCatalogUnavailable, get_provider_models
 
+        warnings: list[str] = []
+
+        class Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                msg = record.getMessage().removeprefix("[PROVIDER]").strip()
+                if msg not in warnings:
+                    warnings.append(msg)
+
         def fetch() -> list[str]:
             cfg = cli._get_provider_config(provider, self.settings)
             module = cli._resolve_provider_module(provider, self.settings)
-            return [str(getattr(m, "id", None) or getattr(m, "name", None) or m) for m in get_provider_models(module, collected_config=cfg, require_catalog=True)]
+            # the provider's config warnings belong on the page, not in the terminal
+            log = logging.getLogger("amplifier_module_" + module.replace("-", "_"))
+            handler, propagate = Collect(logging.WARNING), log.propagate
+            log.addHandler(handler)
+            log.propagate = False
+            try:
+                return [str(getattr(m, "id", None) or getattr(m, "name", None) or m) for m in get_provider_models(module, collected_config=cfg, require_catalog=True)]
+            finally:
+                log.removeHandler(handler)
+                log.propagate = propagate
 
         try:
             timeout = float(os.environ.get("AMPLIFIER_ROUTING_LIST_TIMEOUT", cli._LIVE_LIST_TIMEOUT_S))
@@ -202,6 +221,7 @@ class RoutingService:
             timeout = cli._LIVE_LIST_TIMEOUT_S
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         models, error = None, None
+        started = time.monotonic()
         try:
             models = pool.submit(fetch).result(timeout=timeout * 2)
         except concurrent.futures.TimeoutError:
@@ -212,7 +232,7 @@ class RoutingService:
             error = f"{type(e).__name__}: {e}"[:300]
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-        return {"provider": provider, "models": models, "error": error}
+        return {"provider": provider, "models": models, "error": error, "warnings": warnings, "seconds": round(time.monotonic() - started, 1)}
 
     # -- `amplifier routing create` -------------------------------------------
     def save_matrix(self, body: dict[str, Any]) -> dict[str, Any]:

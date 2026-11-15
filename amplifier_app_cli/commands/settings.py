@@ -27,6 +27,15 @@ def settings(port: int, no_browser: bool, verbose: bool) -> None:
     only and stops when you press Ctrl+C.
     """
     from ..settings_web import SettingsServer
+    from .provider import _ensure_providers_ready
+
+    # Same repair every provider command runs first: after `amplifier update`
+    # the provider modules are gone, and without them nothing can be tested.
+    console.print("[dim]Checking provider modules...[/dim]")
+    try:
+        _ensure_providers_ready()
+    except Exception as e:  # noqa: BLE001 -- the page still works; tests will say why
+        console.print(f"[yellow]Couldn't check provider modules: {e}[/yellow]")
 
     server = SettingsServer(port=port, verbose=verbose)
     url = server.launch_url

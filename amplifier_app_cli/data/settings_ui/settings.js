@@ -247,20 +247,35 @@ function getIn(obj, path, fallback) {
   return o;
 }
 const get = (path, fallback) => getIn(draft, path, fallback);
-function set(path, value) {
-  let o = draft;
+function setIn(obj, path, value) {
+  let o = obj;
   for (const k of path.slice(0, -1)) {
     if (o[k] === null || typeof o[k] !== "object") o[k] = {};
     o = o[k];
   }
   o[path.at(-1)] = value;
-  changed();
 }
-function del(path) {
-  const parent = getIn(draft, path.slice(0, -1));
+function delIn(obj, path) {
+  const parent = getIn(obj, path.slice(0, -1));
   if (parent && typeof parent === "object") delete parent[path.at(-1)];
-  prune(draft);
-  changed();
+  prune(obj);
+}
+const set = (path, value) => { setIn(draft, path, value); changed(); };
+const del = (path) => { delIn(draft, path); changed(); };
+// Home's quick settings save straight to the global file
+async function quickSave(mutate, done = "Saved.") {
+  if (dirty()) return toast("Save or discard your other changes first.");
+  const g = state.scopes.find((s) => s.name === "global");
+  const doc = clone(g.doc);
+  mutate(doc);
+  prune(doc);
+  try {
+    const res = await api("/api/scope", { scope: "global", doc, version: g.version });
+    R.models = {};
+    adopt(res);
+    toast(done);
+    if (R.matrices) refreshRouting({});
+  } catch (e) { showError(e); }
 }
 // drop empty containers so a save never leaves `routing: {overrides: {}}` behind
 function prune(o) {
@@ -312,6 +327,10 @@ function attention() {
   const out = [];
   if (!st.providers.length) out.push({ level: "stop", text: "No providers are set up, so Amplifier can't start a session.", go: "providers", action: "Add a provider", icon: "plus" });
   for (const p of st.providers) for (const k of p.missing_keys) out.push({ level: "stop", text: `${p.name} has no API key (\`${k}\` is empty).`, go: "keys", action: "Add the key", icon: "key" });
+  for (const p of st.providers) {
+    const ml = R.models[p.name];
+    if (ml && ml !== "loading" && !ml.models && !p.missing_keys.length) out.push({ level: "stop", text: `${p.name} isn't answering: ${ml.error}`, go: "providers", action: "Fix the connection", icon: "plug" });
+  }
   if (st.routing.missing) out.push({ level: "stop", text: `The routing matrix \`${st.routing.matrix}\` isn't on this machine.`, go: "routing", action: "Choose a matrix", icon: "route" });
   else if (st.routing.unserved?.length) out.push({ level: "wait", text: `${plural(st.routing.unserved.length, "role")} in ${st.routing.matrix} have no model you can use: ${st.routing.unserved.join(", ")}.`, go: "routing", action: "Fix routing", icon: "route" });
   const every = st.updates.every_hours || 24;
@@ -372,41 +391,110 @@ function rerenderOn(...tabs) {
 const scopeNote = () => (scope === "global" ? null : h("p", { class: "notice", text: `Changes here apply only in this project${scope === "project" ? ", for everyone who uses it" : ", and only for you"}. Anything you don't set comes from your global settings.` }));
 
 // ================================================================ HOME
+// Built for someone new: what's wrong and the button that fixes it, whether each
+// provider actually answers, the few settings people change most, and upkeep.
+function connectionsPanel(st) {
+  const rows = st.providers.map((p) => {
+    const ml = R.models[p.name];
+    if (!ml) loadModels(p.name); // live check, same call as `amplifier provider test`
+    const checking = !ml || ml === "loading";
+    const ok = !checking && ml.models;
+    const lampCls = checking ? "fallback" : ok ? "winner" : "dead";
+    const detail = checking ? "Checking…" : ok ? `Connected. ${plural(ml.models.length, "model")} available (${ml.seconds}s).` : p.missing_keys.length ? "No API key yet." : ml.error;
+    return h("div", { class: "row-item" },
+      lamp(lampCls),
+      h("div", { class: "row-main" },
+        h("div", { class: "row-title" }, h("strong", { text: p.name }), p.default ? tag("default", "act") : null, p.model ? h("code", { class: "hint", text: p.model }) : null),
+        h("div", { class: `hint${!checking && !ok ? " bad" : ""}`, text: detail }),
+        !checking && ml.warnings?.length ? h("ul", { class: "warnings" }, ml.warnings.map((w) => h("li", { text: w }))) : null),
+      h("div", { class: "row-actions" },
+        !checking && !ok ? (p.missing_keys.length ? link("Add key", "#keys", { icon: "key", kind: "small primary" }) : link("Fix", "#providers", { icon: "pencil", kind: "small" })) : null,
+        btn(`Test ${p.name} again`, () => { delete R.models[p.name]; renderMain(); }, { icon: "refresh", only: true, kind: "ghost", disabled: checking })));
+  });
+  return h("section", { class: "panel" },
+    h("header", { class: "panel-head row-head" }, h("div", {}, h("h3", { text: "Connections" }), h("p", { class: "hint", text: "Each provider is asked for its model list. That proves the key works without spending tokens." })),
+      st.providers.length ? btn("Test all", () => { R.models = {}; renderMain(); }, { icon: "plug", small: true }) : null),
+    rows.length ? h("div", { class: "rows" }, rows) : h("div", { class: "pad" }, h("p", { class: "hint", text: "No providers yet." }), link("Add a provider", "#providers", { icon: "plus", kind: "primary" })),
+    h("div", { class: "pad tight" }, link("Manage providers", "#providers", { icon: "chip", kind: "ghost small" })));
+}
+
+function quickSettingsPanel(st) {
+  const g = state.scopes.find((s) => s.name === "global").doc;
+  if (!R.matrices && !R.busy) refreshRouting({});
+  const current = getIn(g, ["routing", "matrix"]) || "balanced";
+  const names = R.matrices ? R.matrices.map((m) => m.name) : [current];
+  const effective = layered(["routing", "matrix"]);
+  const provs = (getIn(g, ["config", "providers"], []) || []).filter((p) => p && typeof p === "object");
+  const prio = (p) => Number(p.config?.priority ?? 999) || 999;
+  const ordered = [...provs].sort((a, b) => prio(a) - prio(b));
+  const makeDefault = (name) => quickSave((d) => {
+    const list = [...(getIn(d, ["config", "providers"]) || [])].sort((a, b) => prio(a) - prio(b));
+    const i = list.findIndex((p) => providerName(p) === name);
+    list.unshift(...list.splice(i, 1));
+    list.forEach((p, n) => { p.config = { ...(p.config || {}), priority: n + 1 }; });
+    setIn(d, ["config", "providers"], list);
+  }, `${name} is now the default provider.`);
+  return panel("Quick settings", "These save as soon as you change them.",
+    h("div", { class: "pad" },
+      ordered.length > 1 ? field("Default provider", h("select", { onchange: (e) => makeDefault(e.target.value) }, ordered.map((p) => h("option", { value: providerName(p), selected: p === ordered[0], text: providerName(p) }))), "Used whenever routing doesn't pick one.") : null,
+      field("Routing", h("select", { onchange: (e) => quickSave((d) => setIn(d, ["routing", "matrix"], e.target.value), `Now using ${e.target.value}.`) }, names.map((n) => h("option", { value: n, selected: n === current, text: n }))),
+        effective.from && effective.from !== "global" ? `This project uses ${effective.val} instead (set in ${effective.from} settings).` : st.routing.missing ? "This matrix isn't on this machine." : `${st.routing.roles - st.routing.unserved.length} of ${plural(st.routing.roles, "role")} have a model. Open Routing to see which.`),
+      notifyControls(g, (mut) => quickSave(mut))));
+}
+
+function maintenancePanel(st) {
+  const check = P.jobs["update-check"];
+  const run = P.jobs.update;
+  const busy = check?.running || run?.running;
+  const upd = st.updates;
+  return panel("Maintenance", null,
+    h("div", { class: "rows" },
+      h("div", { class: "row-item" }, icon("refresh"),
+        h("div", { class: "row-main" }, h("strong", { text: "Updates" }), h("div", { class: "hint", text: `Version ${st.version.display}. ${upd.hours_ago === null ? "Never checked." : `Checked ${fmtAgo(upd.hours_ago)}.`}` })),
+        h("div", { class: "row-actions" },
+          btn(check?.running ? "Checking…" : "Check", () => startJob("update-check"), { icon: "refresh", small: true, disabled: busy }),
+          btn(run?.running ? "Updating…" : "Update", () => { if (confirm("Update Amplifier now? It replaces the program running this page, so you'll reopen it with `amplifier settings` when it's done.")) startJob("update"); }, { icon: "play", small: true, disabled: busy }))),
+      h("div", { class: "row-item" }, icon("undo"),
+        h("div", { class: "row-main" }, h("strong", { text: "Reset" }), h("div", { class: "hint", text: "Clear caches or start over. You choose what to keep, and preview it first." })),
+        h("div", { class: "row-actions" }, link("Reset…", "#reset", { icon: "undo", kind: "small" })))),
+    run || check ? h("div", { class: "pad" }, jobConsole(run || check)) : null);
+}
+
+function setupSteps() {
+  const step = (n, title, hint, go, action) => h("li", {}, h("span", { class: "rank", text: String(n) }), h("div", { class: "row-main" }, h("strong", { text: title }), h("div", { class: "hint", md: hint })), link(action, `#${go}`, { kind: n === 1 ? "primary small" : "small" }));
+  return panel("Get set up", "Five minutes, in this order. You can change any of it later.",
+    h("ol", { class: "steps" },
+      step(1, "Add a provider", "The AI service Amplifier will call, such as Anthropic or OpenAI.", "providers", "Add a provider"),
+      step(2, "Add its API key", "Paste the key from your provider's dashboard. It's stored in keys.env, never in settings.", "keys", "Add a key"),
+      step(3, "Check the connection", "Come back here: Connections tests each provider without spending tokens.", "home", "Check"),
+      step(4, "Choose routing", "Pick which models handle coding, quick tasks and deep reasoning.", "routing", "Choose"),
+      step(5, "Turn on notifications", "Optional: get told when Amplifier is waiting for you.", "notifications", "Set up")));
+}
+
 VIEWS.home = () => {
   const st = status();
   if (!st) return [h("p", { class: "quiet-note", text: "Checking Amplifier…" })];
   if (st.error) return [h("p", { class: "notice stop", text: st.error })];
   const att = attention();
   const worst = att.some((a) => a.level === "stop") ? "dead" : att.length ? "winner unverified" : "winner";
-  const def = st.providers.find((p) => p.default);
-  const upd = st.updates;
-  const secrets = state.keys.filter((k) => SECRET_NAME.test(k.name));
-  const saved = secrets.filter((k) => k.stored || k.in_env).length;
-  const missing = secrets.filter((k) => k.referenced && !(k.stored || k.in_env)).length;
-  const stale = upd.hours_ago === null || upd.hours_ago > (upd.every_hours || 24) * 6;
-  const row = (go, lampCls, ic, what, detail) => h("a", { class: "status-row", href: `#${go}` }, lamp(lampCls), icon(ic), h("span", { class: "what", text: what }), h("span", { class: "detail" }, detail), icon("chevron"));
-  const top = att[0]; // the main button fixes the most urgent problem
+  const top = att[0];
   return [
     h("section", { class: "hero" },
       h("div", { class: "hero-status" }, lamp(worst),
         h("div", {},
-          h("h2", { text: att.length ? `${plural(att.length, "thing needs", "things need")} your attention` : "Amplifier is ready" }),
-          h("p", { text: `Version ${st.version.display}, core ${st.version.core}. ${upd.hours_ago === null ? "Never checked for updates." : `Checked for updates ${fmtAgo(upd.hours_ago)}.`}` }))),
-      h("div", { class: "hero-actions" },
-        top ? link(top.action, `#${top.go}`, { icon: top.icon, kind: "primary" }) : null,
-        btn("Check for updates", () => { location.hash = "#update"; startJob("update-check"); }, { icon: "refresh", kind: top ? "" : "primary" }),
-        link("Change routing", "#routing", { icon: "route" }),
-        link("Reset Amplifier", "#reset", { icon: "undo", kind: "ghost" }))),
-    att.length ? h("div", { class: "attention" }, att.map((a, i) => h("div", { class: `notice ${a.level}` }, h("span", { md: a.text }), i ? link(a.action, `#${a.go}`, { icon: a.icon, kind: "small" }) : null))) : null,
-    h("nav", { class: "status-board", "aria-label": "Status" },
-      row("providers", st.providers.length && !st.providers.some((p) => p.missing_keys.length) ? "winner" : "dead", "chip", "Providers",
-        st.providers.length ? [`${plural(st.providers.length, "provider")}. Default `, h("strong", { text: def.name }), def.model ? [" with ", h("code", { text: def.model })] : null] : "None set up yet"),
-      row("routing", st.routing.missing ? "dead" : st.routing.unserved?.length ? "winner unverified" : "winner", "route", "Routing",
-        st.routing.missing ? `Matrix ${st.routing.matrix} is missing` : [h("strong", { text: st.routing.matrix }), `, ${st.routing.roles - st.routing.unserved.length} of ${plural(st.routing.roles, "role")} served${st.routing.pinned.length ? `, ${st.routing.pinned.length} pinned by you` : ""}`]),
-      row("bundles", "winner", "package", "Bundles", [h("strong", { text: st.bundle.active }), st.bundle.always ? `, plus ${st.bundle.always} always loaded` : ""]),
-      row("keys", missing ? "dead" : "winner", "key", "API keys", `${plural(saved, "key")} saved${missing ? `, ${missing} missing` : ""}`),
-      row("update", stale ? "winner unverified" : "winner", "refresh", "Updates", upd.hours_ago === null ? "Never checked" : `Checked ${fmtAgo(upd.hours_ago)}${upd.every_hours ? `, then every ${upd.every_hours} hours` : ""}`),
-      row("other", st.unread_top_level.length ? "fallback" : "winner", "sliders", "Settings file", st.unread_top_level.length ? `${plural(st.unread_top_level.length, "setting")} the CLI doesn't read` : "Every setting is one Amplifier reads")),
+          h("h2", { text: !st.providers.length ? "Welcome to Amplifier" : att.length ? `${plural(att.length, "thing needs", "things need")} your attention` : "Amplifier is ready" }),
+          att.length ? h("ul", { class: "issues" }, att.map((a) => h("li", { md: a.text }))) : h("p", { text: "Your providers, routing and settings are in order." }))),
+      top ? h("div", { class: "hero-actions" }, link(top.action, `#${top.go}`, { icon: top.icon, kind: "primary" })) : null),
+    !st.providers.length ? setupSteps() : null,
+    h("div", { class: "home-grid" },
+      h("div", { class: "col" }, connectionsPanel(st), maintenancePanel(st)),
+      h("div", { class: "col" }, quickSettingsPanel(st),
+        panel("More", null, h("nav", { class: "rows" },
+          [["bundles", "package", "Bundles", `${st.bundle.active}${st.bundle.always ? `, plus ${st.bundle.always} always loaded` : ""}`],
+           ["keys", "key", "API keys", "Masked; reveal one at a time"],
+           ["other", "sliders", "Other settings", st.unread_top_level.length ? `${plural(st.unread_top_level.length, "setting")} the CLI doesn't read` : "All in use"],
+           ["file", "file", "Settings file", "Edit the YAML directly"]]
+            .map(([go, ic, title, hint]) => h("a", { class: "row-item link", href: `#${go}` }, icon(ic), h("div", { class: "row-main" }, h("strong", { text: title }), h("div", { class: "hint", text: hint })), icon("chevron"))))))),
   ];
 };
 
@@ -564,7 +652,8 @@ async function loadModels(provider) {
   } catch (e) {
     R.models[provider] = { models: null, error: e.message };
   }
-  rerenderOn("routing", "providers");
+  renderNav();
+  rerenderOn("routing", "providers", "home");
 }
 
 function setFlat(obj, dotted, value) {
@@ -674,12 +763,15 @@ function secretWidget(name, emptyText = "Not set") {
         delete P.revealed[name];
         R.models = {};
         toast(`Saved \`${name}\`.`);
+        const after = P.afterKey?.name === name ? P.afterKey.run : null;
+        P.afterKey = null;
         renderNav();
         renderMain();
+        if (after) after();
       } catch (e) { toast(e.message); }
     };
     setTimeout(() => input.focus(), 0);
-    return h("div", { class: "secret" }, input, btn("Save", saveIt, { icon: "check", kind: "primary" }), btn("Cancel", () => { P.editingKey = null; renderMain(); }, { icon: "x", only: true, kind: "ghost" }));
+    return h("div", { class: "secret" }, input, btn("Save", saveIt, { icon: "check", kind: "primary" }), btn("Cancel", () => { P.editingKey = null; P.afterKey = null; renderMain(); }, { icon: "x", only: true, kind: "ghost" }));
   }
   const toggleShow = async () => {
     if (shown !== undefined) delete P.revealed[name];
@@ -751,7 +843,8 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
         btn(`Move ${name} up`, () => { const a = [...ordered]; [a[i - 1], a[i]] = [a[i], a[i - 1]]; commit(a); }, { icon: "up", only: true, kind: "ghost", disabled: i === 0 }),
         btn(`Move ${name} down`, () => { const a = [...ordered]; [a[i + 1], a[i]] = [a[i], a[i + 1]]; commit(a); }, { icon: "down", only: true, kind: "ghost", disabled: i === ordered.length - 1 }),
         btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger" })),
-      ml && ml !== "loading" && !ml.models && ml.error ? h("p", { class: "notice wait", text: ml.error }) : null,
+      ml && ml !== "loading" && !ml.models && ml.error ? h("p", { class: "notice stop", text: ml.error }) : null,
+      ml && ml !== "loading" && ml.warnings?.length ? h("div", { class: "notice wait" }, h("ul", { class: "warnings" }, ml.warnings.map((w) => h("li", { text: w })))) : null,
       serves[name]?.length ? h("p", { class: "hint", text: `Gets the work for ${plural(serves[name].length, "role")} in ${inUseMatrix}: ${serves[name].join(", ")}.` }) : null,
       h("div", { class: "fields" },
         field("Name", textIn(p.id, (v) => { if (v.trim()) p.id = v.trim(); else delete p.id; touch(); }), "How routing and `amplifier provider edit` refer to it."),
@@ -848,11 +941,35 @@ VIEWS.folders = () => {
   ];
 };
 
+// Same settings `amplifier notify desktop|ntfy` writes; the ntfy topic lives in keys.env.
+const NTFY_TOPIC = "AMPLIFIER_NTFY_TOPIC";
+const NOTIFY = ["config", "notifications"];
+function notifyControls(doc, apply) {
+  const desktopOn = truthy(getIn(doc, [...NOTIFY, "desktop", "enabled"]));
+  const pushOn = truthy(getIn(doc, [...NOTIFY, "ntfy", "enabled"])) || truthy(getIn(doc, [...NOTIFY, "push", "enabled"]));
+  const topic = state.keys.find((k) => k.name === NTFY_TOPIC);
+  const hasTopic = Boolean(topic && (topic.stored || topic.in_env));
+  const setPush = (on) => apply((d) => { setIn(d, [...NOTIFY, "ntfy", "enabled"], on); delIn(d, [...NOTIFY, "push", "enabled"]); });
+  return [
+    switchRow("Desktop notifications", "A notification on this computer when the assistant finishes and is waiting for you.", desktopOn, (on) => apply((d) => setIn(d, [...NOTIFY, "desktop", "enabled"], on))),
+    switchRow("Phone notifications", "Through the free ntfy app: install it, then subscribe to the topic below.", pushOn, (on) => {
+      if (on && !hasTopic) {
+        P.editingKey = NTFY_TOPIC;
+        P.afterKey = { name: NTFY_TOPIC, run: () => setPush(true) }; // switch on once the topic is saved
+        renderMain();
+        return toast("Choose a topic first. Make it long and hard to guess.");
+      }
+      setPush(on);
+    }),
+    pushOn || hasTopic || P.editingKey === NTFY_TOPIC
+      ? field("Phone topic", secretWidget(NTFY_TOPIC, "No topic yet"), "Anyone who knows your topic can read your notifications, so it's kept in keys.env, never in settings.")
+      : null,
+    pushOn && !hasTopic ? h("p", { class: "notice wait", text: "Phone notifications are on but have no topic, so nothing will be sent. Add a topic above." }) : null,
+  ];
+}
 VIEWS.notifications = () => [
   scopeNote(),
-  panel(null, null, h("div", { class: "pad" },
-    switchRow("Desktop notification", "When the assistant finishes and is waiting for you.", truthy(get(["config", "notifications", "desktop", "enabled"])), (on) => set(["config", "notifications", "desktop", "enabled"], on)),
-    switchRow("Push to your phone", "Through ntfy.sh. Set your topic with `amplifier notify ntfy`; it's kept in keys.env because anyone with it can read your notifications.", truthy(get(["config", "notifications", "push", "enabled"])), (on) => set(["config", "notifications", "push", "enabled"], on)))),
+  panel(null, null, h("div", { class: "pad" }, notifyControls(draft, (mut) => { mut(draft); prune(draft); changed(); renderMain(); }))),
 ];
 
 // ================================================================ KEYS
@@ -899,7 +1016,7 @@ async function pollJob(kind) {
   } catch {
     P.jobs[kind] = { ...job, lost: true, running: false };
   }
-  rerenderOn("update", "reset");
+  rerenderOn("update", "reset", "home");
   if (P.jobs[kind].running) setTimeout(() => pollJob(kind), 800);
   else if (kind.startsWith("update")) refreshStatus();
 }
