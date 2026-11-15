@@ -3,7 +3,7 @@
 #
 #   scripts/settings-sandbox              reuse the sandbox (fast after the first run)
 #   scripts/settings-sandbox --copy       start from a copy of your real settings and routing;
-#                                         key names are kept, values become placeholders
+#                                         secret values become placeholders; URLs and numbers are kept
 #   scripts/settings-sandbox --fresh      wipe the sandbox first
 #   scripts/settings-sandbox --real-keys  pass your shell's keys through (connection checks hit real APIs)
 #   Anything else is passed to `amplifier settings` (e.g. --no-browser --port 8770).
@@ -35,10 +35,12 @@ if [ "$copy" = 1 ]; then
   mkdir -p "$root/home/cache"
   for d in "$real"/cache/amplifier-bundle-routing-matrix-*; do [ -d "$d" ] && cp -R "$d" "$root/home/cache/"; done
   if [ -f "$real/keys.env" ]; then
-    sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1="sandbox-placeholder"/' "$real/keys.env" > "$root/home/keys.env"
+    # secrets (names ending KEY/TOKEN/SECRET/PASSWORD) become placeholders; plain values such as
+    # base URLs and context sizes are copied, so providers point at the right servers
+    sed -E 's/^([A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD))=.*/\1="sandbox-placeholder"/I' "$real/keys.env" > "$root/home/keys.env"
     chmod 600 "$root/home/keys.env"
   fi
-  echo "Copied your settings and routing into the sandbox (keys replaced with placeholders)."
+  echo "Copied your settings and routing into the sandbox (secret values replaced with placeholders)."
 fi
 
 echo "Sandbox: $root  (its own Amplifier home and Python environment; ~/.amplifier is untouched)"

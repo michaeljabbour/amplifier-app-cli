@@ -75,7 +75,7 @@ main:focus { outline: none; }
 .lede { max-width: 76ch; color: var(--ink-2); }
 
 /* ---------- surfaces: one border per box, spacing inside ---------- */
-.panel, .board, .status-board, .hero { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; }
+.panel, .board, .hero { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; }
 .panel { overflow: hidden; }
 .panel-head { padding: 16px 20px 4px; display: flex; flex-direction: column; gap: 2px; }
 .panel h3 { font-size: 15px; }
@@ -150,9 +150,6 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 .hero-actions { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
 .hero-actions .btn { justify-content: flex-start; }
 
-.status-row > .icon { color: var(--ink-2); }
-.status-row > .icon:last-child { color: var(--faint); }
-
 /* home layout: rows with a lamp or icon, text, and actions */
 .home-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 20px; align-items: start; }
 .col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
@@ -170,7 +167,6 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 .row-actions { display: flex; gap: 4px; align-items: center; }
 .hint.bad { color: var(--stop); overflow-wrap: anywhere; }
 .warnings { margin: 4px 0 0; padding-left: 16px; color: var(--wait); font-size: 12px; }
-.warnings li .btn { margin-left: 6px; color: var(--ink); }
 .keycard .notice { margin-top: 6px; font-size: 13px; }
 .pad.tight { padding-top: 4px; padding-bottom: 12px; }
 .issues { margin: 6px 0 0; padding-left: 18px; color: var(--ink-2); }
@@ -253,7 +249,7 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 details > summary { cursor: pointer; color: var(--ink-2); font-size: 13px; font-weight: 600; width: fit-content; }
 details[open] > summary { margin-bottom: 10px; }
 
-/* ---------- lists, keys, file ---------- */
+/* ---------- lists, keys, settings file ---------- */
 .list { list-style: none; margin: 0; padding: 4px 0; }
 .list > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 4px 12px 4px 20px; }
 .list > li:hover { background: var(--hover); }
@@ -269,10 +265,8 @@ details[open] > summary { margin-bottom: 10px; }
 .keycard + .keycard { border-top: 1px solid var(--rule); }
 .keycard .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 
-pre.view { margin: 0; padding: 16px 20px; font-family: var(--mono); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 70vh; overflow: auto; }
 textarea.yaml { min-height: 62vh; border: 0; border-radius: 0; padding: 16px 20px; tab-size: 2; }
 textarea.yaml:focus { outline-offset: -2px; }
-.provenance { display: flex; gap: 6px; flex-wrap: wrap; padding: 14px 20px; border-bottom: 1px solid var(--rule); }
 
 /* ---------- command output ---------- */
 .console { background: #111214; color: #d9dbe0; border-radius: 10px; overflow: hidden; }
