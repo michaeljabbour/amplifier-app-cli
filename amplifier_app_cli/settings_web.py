@@ -85,6 +85,11 @@ def read_doc(path: Path) -> tuple[dict[str, Any], str | None]:
     return data, None
 
 
+def scope_docs(settings: AppSettings) -> list[dict[str, Any]]:
+    """The parsed global, project and local documents (broken files read as empty)."""
+    return [read_doc(settings.get_scope_path(s))[0] for s in EDITABLE_SCOPES]
+
+
 def placeholders(value: Any) -> set[str]:
     """Every ${VAR} referenced anywhere in a settings value."""
     if isinstance(value, str):
@@ -141,7 +146,7 @@ def validate_doc(doc: Any) -> list[str]:
 def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keys the page shows: everything in keys.env plus every ${VAR} settings use."""
     stored = system.read_keys_file()
-    referenced = set().union(*(placeholders(d) for d in docs)) if docs else set()
+    referenced = set().union(*(placeholders(d) for d in docs))
     out = []
     for name in sorted(referenced | set(stored)):
         value = stored.get(name) or os.environ.get(name)
@@ -298,35 +303,46 @@ def save_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
     return {**build_state(server.settings, server.routing), "env": server.env.info()}
 
 
-def sync_env(server: SettingsServer, force: bool = False) -> None:
-    """Pick up keys.env and shell-profile changes made since launch (throttled)."""
-    docs = [read_doc(server.settings.get_scope_path(s))[0] for s in EDITABLE_SCOPES]
-    names = set().union(*(placeholders(d) for d in docs)) | {system.NTFY_TOPIC}
-    if server.env.refresh(names, force=force):
+def sync_env(server: SettingsServer, force: bool = False, shell: bool = True) -> None:
+    """Pick up keys.env changes (always) and the login shell's (first call, or `force`).
+
+    `shell=False` never runs the shell: that keeps the page's frequent poll cheap.
+    """
+    names = set().union(*(placeholders(d) for d in scope_docs(server.settings))) | {system.NTFY_TOPIC}
+    if server.env.refresh(names, force=force, shell=shell):
         server.routing.refresh()  # values changed: model lists must be fetched again
 
 
 def state(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+    """Everything the page shows. `?fresh=1` re-reads the login shell (the page sends it on focus)."""
     sync_env(server, force=q.get("fresh") == "1")
     return {**build_state(server.settings, server.routing), "env": server.env.info()}
 
 
 def changes(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
-    """A fingerprint of everything the page shows; it polls this to stay current."""
-    sync_env(server)
+    """A fingerprint of everything the page shows; it polls this to stay current. Never runs a shell."""
+    sync_env(server, shell=False)
+    home = get_amplifier_home()
     parts = [file_version(server.settings.get_scope_path(s)) for s in EDITABLE_SCOPES]
-    parts.append(file_version(get_amplifier_home() / "keys.env"))
-    routing_dir = get_amplifier_home() / "routing"
-    if routing_dir.is_dir():
-        parts += [f"{f.name}:{f.stat().st_mtime_ns}" for f in sorted(routing_dir.glob("*.yaml"))]
+    parts.append(file_version(home / "keys.env"))
+    parts += [f"{f.name}:{f.stat().st_mtime_ns}" for f in sorted((home / "routing").glob("*.yaml"))]
     parts.append(server.env.fingerprint)
     return {"fingerprint": hashlib.sha256("|".join(parts).encode()).hexdigest()}
 
 
+def routing_models(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+    sync_env(server)
+    return server.routing.models(q.get("provider", ""))
+
+
+def diagnose_provider(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
+    sync_env(server, force=True)  # diagnose what a new terminal would see right now
+    return diagnose(server.settings, str(body.get("name") or ""), server.env)
+
+
 def reveal_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
     name = str(body.get("name") or "")
-    docs = [read_doc(server.settings.get_scope_path(s))[0] for s in EDITABLE_SCOPES]
-    return {"value": system.reveal_key(name, {k["name"] for k in key_list(docs)})}
+    return {"value": system.reveal_key(name, {k["name"] for k in key_list(scope_docs(server.settings))})}
 
 
 def provider_schema(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
@@ -348,13 +364,13 @@ ROUTES: dict[tuple[str, str], Handler] = {
     ("GET", "/api/provider-schema"): provider_schema,
     ("GET", "/api/jobs"): lambda s, q: s.jobs.get(q.get("id", "")),
     ("GET", "/api/routing/matrices"): lambda s, q: {"matrices": s.routing.matrices()},
-    ("GET", "/api/routing/models"): lambda s, q: (sync_env(s), s.routing.models(q.get("provider", "")))[1],
+    ("GET", "/api/routing/models"): routing_models,
     ("POST", "/api/scope"): save_scope,
     ("POST", "/api/key"): save_key,
     ("POST", "/api/key/reveal"): reveal_key,
     ("POST", "/api/jobs"): lambda s, b: s.jobs.start(str(b.get("kind")), b.get("options") if isinstance(b.get("options"), dict) else {}),
     ("POST", "/api/notify/test"): lambda s, b: system.notify_test(s.settings.get_merged_settings()),
-    ("POST", "/api/providers/diagnose"): lambda s, b: (sync_env(s, force=True), diagnose(s.settings, str(b.get("name") or ""), s.env))[1],
+    ("POST", "/api/providers/diagnose"): diagnose_provider,
     ("POST", "/api/routing/resolve"): lambda s, b: s.routing.resolve(str(b.get("matrix") or ""), b.get("overrides") or {}, bool(b.get("live"))),
     ("POST", "/api/routing/matrix"): lambda s, b: s.routing.save_matrix(b),
     ("POST", "/api/routing/matrix/delete"): lambda s, b: s.routing.delete_matrix(str(b.get("name") or "")),

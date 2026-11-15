@@ -153,7 +153,17 @@ def test_key_values_are_write_only(settings: AppSettings, home: Path) -> None:
 
 
 @pytest.fixture
-def server(settings: AppSettings):
+def shell_reads(home: Path, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Stand in for the user's login shell (never run the real one in tests); counts reads."""
+    from amplifier_app_cli import settings_web_env
+
+    calls: list[int] = []
+    monkeypatch.setattr(settings_web_env, "login_shell_env", lambda: calls.append(1) or {"HOME": str(home)})
+    return calls
+
+
+@pytest.fixture
+def server(settings: AppSettings, shell_reads: list[int]):
     srv = SettingsServer(port=0, settings=settings)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -227,6 +237,22 @@ def test_http_guards(server: SettingsServer) -> None:
     )  # no cookie
     r, _ = _req(server, "POST", "/api/scope", {**ok, "X-Amplifier-Settings": "1"}, body)
     assert r.status == 200
+
+
+def test_only_state_fresh_and_diagnose_rerun_the_shell(server: SettingsServer, shell_reads: list[int]) -> None:
+    cookie = (_req(server, "GET", f"/?t={server.launch_token}")[0].getheader("Set-Cookie") or "").split(";")[0]
+    ok = {"Cookie": cookie}
+    assert _req(server, "GET", "/api/changes", ok)[0].status == 200
+    assert shell_reads == []  # the poll never starts a shell, not even the first time
+    assert _req(server, "GET", "/api/state", ok)[0].status == 200
+    assert len(shell_reads) == 1  # startup read
+    for path in ("/api/state", "/api/changes", "/api/changes"):
+        assert _req(server, "GET", path, ok)[0].status == 200
+    assert len(shell_reads) == 1
+    assert _req(server, "GET", "/api/state?fresh=1", ok)[0].status == 200
+    assert len(shell_reads) == 2  # page regained focus
+    _req(server, "POST", "/api/providers/diagnose", {**ok, "X-Amplifier-Settings": "1"}, {"name": "nope"})
+    assert len(shell_reads) == 3  # diagnose sees what a new terminal would
 
 
 def test_static_assets_ship_with_package() -> None:
