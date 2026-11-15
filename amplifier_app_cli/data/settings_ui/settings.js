@@ -88,7 +88,7 @@ function h(tag, props = {}, ...kids) {
     if (v === undefined || v === null || v === false) continue;
     if (k === "class") el.className = v;
     else if (k === "text") el.textContent = String(v);
-    else if (k === "md") el.append(...md(String(v)));
+    else if (k === "md") el.append(h("span", {}, md(String(v)))); // one inline run, even inside flex containers
     else if (k === "vars") for (const [n, val] of Object.entries(v)) el.style.setProperty(n, val);
     else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k in el && typeof v !== "string") el[k] = v;
@@ -326,10 +326,11 @@ function attention() {
   if (!st || st.error) return [];
   const out = [];
   if (!st.providers.length) out.push({ level: "stop", text: "No providers are set up, so Amplifier can't start a session.", go: "providers", action: "Add a provider", icon: "plus" });
+  for (const p of st.providers) for (const k of p.shadowed_keys || []) out.push({ level: "stop", text: `${p.name} is using a different \`${k}\` from your shell or system environment, not the one you saved. Amplifier never overrides an existing environment variable.`, go: "keys", action: "See how to fix", icon: "key" });
   for (const p of st.providers) for (const k of p.missing_keys) out.push({ level: "stop", text: `${p.name} has no API key (\`${k}\` is empty).`, go: "keys", action: "Add the key", icon: "key" });
   for (const p of st.providers) {
     const ml = R.models[p.name];
-    if (ml && ml !== "loading" && !ml.models && !p.missing_keys.length) out.push({ level: "stop", text: `${p.name} isn't answering: ${ml.error}`, go: "providers", action: "Fix the connection", icon: "plug" });
+    if (ml && ml !== "loading" && !ml.models && !p.missing_keys.length && !(p.shadowed_keys || []).length) out.push({ level: "stop", text: `${p.name} isn't answering: ${ml.error}`, go: "providers", action: "Fix the connection", icon: "plug" });
   }
   if (st.routing.missing) out.push({ level: "stop", text: `The routing matrix \`${st.routing.matrix}\` isn't on this machine.`, go: "routing", action: "Choose a matrix", icon: "route" });
   else if (st.routing.unserved?.length) out.push({ level: "wait", text: `${plural(st.routing.unserved.length, "role")} in ${st.routing.matrix} have no model you can use: ${st.routing.unserved.join(", ")}.`, go: "routing", action: "Fix routing", icon: "route" });
@@ -400,13 +401,14 @@ function connectionsPanel(st) {
     const checking = !ml || ml === "loading";
     const ok = !checking && ml.models;
     const lampCls = checking ? "fallback" : ok ? "winner" : "dead";
-    const detail = checking ? "Checking…" : ok ? `Connected. ${plural(ml.models.length, "model")} available (${ml.seconds}s).` : p.missing_keys.length ? "No API key yet." : ml.error;
+    const shadow = (p.shadowed_keys || [])[0];
+    const detail = checking ? "Checking…" : ok ? `Connected. ${plural(ml.models.length, "model")} available (${ml.seconds}s).` : p.missing_keys.length ? "No API key yet." : shadow ? `${ml.error.replace(/\.$/, "")}. The ${shadow} in your environment is overriding the saved key.` : ml.error;
     return h("div", { class: "row-item" },
       lamp(lampCls),
       h("div", { class: "row-main" },
         h("div", { class: "row-title" }, h("strong", { text: p.name }), p.default ? tag("default", "act") : null, p.model ? h("code", { class: "hint", text: p.model }) : null),
         h("div", { class: `hint${!checking && !ok ? " bad" : ""}`, text: detail }),
-        !checking && ml.warnings?.length ? h("ul", { class: "warnings" }, ml.warnings.map((w) => h("li", { text: w }))) : null),
+        !checking && ml.warnings?.length ? warningList(ml.warnings, p.name) : null),
       h("div", { class: "row-actions" },
         !checking && !ok ? (p.missing_keys.length ? link("Add key", "#keys", { icon: "key", kind: "small primary" }) : link("Fix", "#providers", { icon: "pencil", kind: "small" })) : null,
         btn(`Test ${p.name} again`, () => { delete R.models[p.name]; renderMain(); }, { icon: "refresh", only: true, kind: "ghost", disabled: checking })));
@@ -786,6 +788,26 @@ function secretWidget(name, emptyText = "Not set") {
     btn(has ? "Change" : SECRET_NAME.test(name) ? "Add key" : "Set", () => { P.editingKey = name; renderMain(); }, has ? { icon: "pencil", only: true, kind: "ghost" } : { icon: "plus", kind: SECRET_NAME.test(name) ? "primary" : "" }));
 }
 
+// provider config warnings; "Config key 'X' is a DEPRECATED alias for 'Y'" gets a rename button
+function warningList(warnings, providerName_) {
+  return h("ul", { class: "warnings" }, warnings.map((w) => {
+    const m = w.match(/Config key '(\w+)' is a DEPRECATED alias for '(\w+)'/);
+    return h("li", {}, h("span", { text: w }), m ? btn(`Rename ${m[1]} to ${m[2]}`, () => renameConfigKey(providerName_, m[1], m[2]), { icon: "pencil", small: true, kind: "ghost" }) : null);
+  }));
+}
+function renameConfigKey(name, from, to) {
+  const g = state.scopes.find((s) => s.name === "global").doc;
+  const inGlobal = (getIn(g, ["config", "providers"], []) || []).some((p) => providerName(p) === name && from in (p.config || {}));
+  if (!inGlobal) return toast(`${name}'s \`${from}\` isn't in your global settings. Edit it on the Providers page.`);
+  quickSave((d) => {
+    for (const p of getIn(d, ["config", "providers"], []) || []) {
+      if (providerName(p) !== name || !(from in (p.config || {}))) continue;
+      if (!(to in p.config)) p.config[to] = p.config[from];
+      delete p.config[from];
+    }
+  }, `Renamed ${from} to ${to} for ${name}.`);
+}
+
 function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
   const name = providerName(p);
   const cfg = p.config || {};
@@ -844,7 +866,7 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
         btn(`Move ${name} down`, () => { const a = [...ordered]; [a[i + 1], a[i]] = [a[i], a[i + 1]]; commit(a); }, { icon: "down", only: true, kind: "ghost", disabled: i === ordered.length - 1 }),
         btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger" })),
       ml && ml !== "loading" && !ml.models && ml.error ? h("p", { class: "notice stop", text: ml.error }) : null,
-      ml && ml !== "loading" && ml.warnings?.length ? h("div", { class: "notice wait" }, h("ul", { class: "warnings" }, ml.warnings.map((w) => h("li", { text: w })))) : null,
+      ml && ml !== "loading" && ml.warnings?.length ? h("div", { class: "notice wait" }, warningList(ml.warnings, name)) : null,
       serves[name]?.length ? h("p", { class: "hint", text: `Gets the work for ${plural(serves[name].length, "role")} in ${inUseMatrix}: ${serves[name].join(", ")}.` }) : null,
       h("div", { class: "fields" },
         field("Name", textIn(p.id, (v) => { if (v.trim()) p.id = v.trim(); else delete p.id; touch(); }), "How routing and `amplifier provider edit` refer to it."),
@@ -982,7 +1004,8 @@ VIEWS.keys = () => {
     }
   }
   const card = (k) => h("div", { class: "keycard" },
-    h("div", { class: "who" }, h("code", { text: k.name }), h("span", { class: "hint", text: usedBy[k.name] ? `Used by ${[...usedBy[k.name]].join(", ")}` : k.referenced ? "Used by your settings" : "Not used by any provider" })),
+    h("div", { class: "who" }, h("code", { text: k.name }), h("span", { class: "hint", text: k.name === NTFY_TOPIC ? "Your phone notifications topic" : usedBy[k.name] ? `Used by ${[...usedBy[k.name]].join(", ")}` : k.referenced ? "Used by your settings" : "Not used by any provider" }),
+      k.shadowed ? h("p", { class: "notice stop", md: `Overridden: your shell or system environment sets a different \`${k.name}\`, and that one is used. To use the saved key, run \`launchctl unsetenv ${k.name}\` (macOS) and remove any \`export ${k.name}=\` from your shell profile, then open a new terminal.` }) : null),
     secretWidget(k.name, SECRET_NAME.test(k.name) ? "Missing" : "Not set (provider default)"));
   const nk = h("input", { type: "text", class: "code", placeholder: "NEW_KEY_NAME", "aria-label": "New key name" });
   const addKey = () => {

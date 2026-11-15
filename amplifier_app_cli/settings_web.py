@@ -153,6 +153,9 @@ def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 # KeyManager copies keys.env into the environment, so the
                 # environment only tells us something for keys not in the file
                 "in_env": name not in stored and bool(os.environ.get(name)),
+                # Amplifier never overrides a variable already in the environment, so a
+                # different shell/launchctl value silently wins over the saved key
+                "shadowed": name in stored and bool(os.environ.get(name)) and os.environ[name] != stored[name],
                 "referenced": name in referenced,
                 "preview": system.mask(value) if value else None,
             }

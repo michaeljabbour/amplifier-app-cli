@@ -102,3 +102,20 @@ def test_status_flags_missing_keys_and_unread_settings(home: Path, tmp_path: Pat
     assert st["providers"][0]["missing_keys"] == ["MY_KEY"]
     assert st["unread_top_level"] == ["max_iterations"]
     assert st["routing"]["matrix"] == "balanced"
+
+
+def test_environment_value_shadowing_a_saved_key_is_flagged(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Amplifier never overrides an exported variable, so a stale one silently wins."""
+    (home / "keys.env").write_text('MY_KEY="saved-good-key-0123456789"\n')
+    monkeypatch.setenv("MY_KEY", "stale-shell-key-9876543210")
+    (home / "settings.yaml").write_text(
+        yaml.safe_dump({"config": {"providers": [{"id": "a", "module": "provider-anthropic", "config": {"api_key": "${MY_KEY}"}}]}})
+    )
+    proj = tmp_path / "p2" / ".amplifier"
+    proj.mkdir(parents=True)
+    settings = AppSettings(SettingsPaths(home / "settings.yaml", proj / "settings.yaml", proj / "settings.local.yaml"))
+    state = build_state(settings, RoutingService(settings))
+    key = next(k for k in state["keys"] if k["name"] == "MY_KEY")
+    assert key["shadowed"] and key["stored"]
+    assert state["status"]["providers"][0]["shadowed_keys"] == ["MY_KEY"]
+    assert "stale-shell" not in str(state) and "saved-good" not in str(state)  # neither value leaks

@@ -170,6 +170,8 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 .row-actions { display: flex; gap: 4px; align-items: center; }
 .hint.bad { color: var(--stop); overflow-wrap: anywhere; }
 .warnings { margin: 4px 0 0; padding-left: 16px; color: var(--wait); font-size: 12px; }
+.warnings li .btn { margin-left: 6px; color: var(--ink); }
+.keycard .notice { margin-top: 6px; font-size: 13px; }
 .pad.tight { padding-top: 4px; padding-bottom: 12px; }
 .issues { margin: 6px 0 0; padding-left: 18px; color: var(--ink-2); }
 .issues li + li { margin-top: 2px; }

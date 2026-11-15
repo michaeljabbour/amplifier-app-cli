@@ -271,7 +271,8 @@ def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict
             for m in [PLACEHOLDER_ONLY.match(v)]
             if m and m.group(1) not in have_key
         ]
-        providers.append({"name": routing.provider_name(p), "model": cfg.get("default_model"), "default": i == 0, "missing_keys": missing})
+        shadowed = [k["name"] for k in keys if k.get("shadowed") and any(f"${{{k['name']}}}" == v for v in cfg.values())]
+        providers.append({"name": routing.provider_name(p), "model": cfg.get("default_model"), "default": i == 0, "missing_keys": missing, "shadowed_keys": shadowed})
 
     rcfg = merged.get("routing") or {}
     route: dict[str, Any] = {"matrix": rcfg.get("matrix", "balanced")}
