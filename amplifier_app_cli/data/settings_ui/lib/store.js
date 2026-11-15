@@ -1,10 +1,11 @@
 // Page state. One scope document (global / project / local) is edited at a time:
 // pages read and write `S.draft`, and "Save changes" writes it back. Pages never
 // import app.js; they ask for a repaint through paint() and listen with on().
-import { api } from "./api.js";
+import { api, MASKED } from "./api.js";
 import { $, h, btn, toast } from "./dom.js";
 
-export const S = { state: null, scope: "global", tab: "home", draft: {}, original: "{}" };
+// `raw` is the File page's text for one scope: {scope, yaml, version, text}, loaded on demand
+export const S = { state: null, scope: "global", tab: "home", draft: {}, original: "{}", raw: null };
 export const SCOPES = {
   global: ["Global", "Your defaults, everywhere"],
   project: ["Project", "Shared with everyone in this project"],
@@ -58,7 +59,12 @@ export const truthy = (v) => v === true || v === "true";
 // ---------------------------------------------------------------- the draft
 export const cur = () => S.state.scopes.find((s) => s.name === S.scope);
 export const globalScope = () => S.state.scopes.find((s) => s.name === "global");
-export const dirty = () => JSON.stringify(S.draft) !== S.original;
+export const docDirty = () => JSON.stringify(S.draft) !== S.original;
+export const rawDirty = () => Boolean(S.raw && S.raw.text !== S.raw.yaml);
+export const dirty = () => docDirty() || rawDirty();
+// the CLI's own defaults, from /api/state
+export const defaults = () => S.state?.defaults || {};
+export const hasMasked = (v) => v === MASKED || (v !== null && typeof v === "object" && Object.values(v).some(hasMasked));
 export const changed = () => { $("savebar").hidden = !dirty(); };
 export const get = (path, fallback) => getIn(S.draft, path, fallback);
 export const set = (path, value) => { setIn(S.draft, path, value); changed(); };
@@ -90,7 +96,8 @@ export const providerName = (p) => p.id || String(p.module).replace(/^provider-/
 const prio = (p) => Number(p.config?.priority ?? 999) || 999;
 export const providersIn = (doc) => [...(getIn(doc, ["config", "providers"], []) || [])].filter((p) => p && typeof p === "object").sort((a, b) => prio(a) - prio(b));
 export const renumber = (list) => list.forEach((p, i) => { p.config = { ...(p.config || {}), priority: i + 1 }; });
-export const PLACEHOLDER = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+// ${NAME} or ${NAME:default}, as lib/env_vars.py ENV_PATTERN reads them
+export const PLACEHOLDER = /^\$\{([^}:]+)(?::[^}]*)?\}$/;
 export const keyInfo = (name) => S.state.keys.find((k) => k.name === name);
 
 // live model lists, same call as `amplifier provider test`; "loading" while in flight
@@ -114,14 +121,15 @@ export function adopt(next, fromServer = false) {
   S.state = next;
   S.draft = clone(cur().doc);
   S.original = JSON.stringify(S.draft);
+  S.raw = null; // the File page fetches the text again when it's shown
   if (fromServer) clearModels();
   view.all();
   emit("adopt", fromServer);
 }
-// re-read everything; `fresh` also re-reads the login shell's environment
-export async function reload({ fresh = false, message } = {}) {
+// re-read everything
+export async function reload({ message } = {}) {
   try {
-    adopt(await api(`/api/state${fresh ? "?fresh=1" : ""}`), true);
+    adopt(await api("/api/state"), true);
     if (message) toast(message);
   } catch (e) { toast(e.message); }
 }
@@ -143,12 +151,13 @@ export function adoptKeys(res) {
 }
 
 export function showError(e) {
+  if (e.halt) return; // the page is showing why it stopped
   const box = h("div", { class: "notice stop" }, h("div", {}, h("strong", { md: e.message }), e.data?.errors ? h("ul", {}, e.data.errors.map((m) => h("li", { text: m }))) : null));
   if (e.status === 409 && !e.data?.exists) box.append(btn("Reload and drop my changes", () => reload(), { icon: "refresh" }));
   $("main").prepend(box);
   box.scrollIntoView({ block: "nearest" });
 }
-// write one scope: {doc} or {yaml}; returns true when saved
+// write one scope: {doc} or {yaml, version}; returns true when saved
 export async function writeScope(name, body, done) {
   const sc = S.state.scopes.find((s) => s.name === name);
   try {
@@ -164,7 +173,9 @@ export async function writeScope(name, body, done) {
 }
 // shown on scoped pages when editing a project file
 export const scopeNote = () => (S.scope === "global" ? null : h("p", { class: "notice", text: `Changes here apply only in this project${S.scope === "project" ? ", for everyone who uses it" : ", and only for you"}. Anything you don't set comes from your global settings.` }));
-export const saveDraft = () => writeScope(S.scope, { doc: S.draft }, `Saved ${SCOPES[S.scope][0].toLowerCase()} settings.`);
+export const saveDraft = () => (rawDirty()
+  ? writeScope(S.scope, { yaml: S.raw.text, version: S.raw.version }, "Saved the settings file.")
+  : writeScope(S.scope, { doc: S.draft }, `Saved ${SCOPES[S.scope][0].toLowerCase()} settings.`));
 // Home's quick settings save straight to the global file
 export function quickSave(mutate, done = "Saved.") {
   if (dirty()) return toast("Save or discard your other changes first.");

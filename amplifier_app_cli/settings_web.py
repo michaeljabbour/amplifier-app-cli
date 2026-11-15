@@ -6,29 +6,37 @@ through ``AppSettings.write_scope``, the same funnel every CLI command uses.
 So atomic writes and plaintext-secret normalization apply exactly as they do
 for `amplifier provider`. Every form on the page is a view over that document.
 
-Safety model (shared with constellation-observatory and amplifier-unified):
-  * binds 127.0.0.1 only, random port by default
-  * the printed link carries a per-launch token, exchanged for an HttpOnly,
-    SameSite=Strict cookie named for this port (so two instances don't collide)
+Safety model:
+  * binds 127.0.0.1 only, random port by default; HTTP/1.0, one request per
+    connection, so an unread request body can never become a second request
+  * the page and its scripts are public; every /api request needs the session
+    secret in the X-Amplifier-Settings header. The page gets that secret once,
+    by posting the single-use launch token from the printed link's #fragment to
+    /api/session, and keeps it in sessionStorage (scoped to this origin and
+    port). No cookies.
   * Host must match (blocks DNS rebinding); Origin and Sec-Fetch-Site must be
-    same-origin; POSTs need a custom header (forces a CORS preflight, never answered)
+    same-origin
   * strict CSP with no inline script or style; responses are never cached
-  * saves carry the sha256 of the file the user loaded; a file that changed
-    underneath is a 409, never a silent overwrite
-  * key values are masked in every response; one key is revealed only when asked
+  * saves carry the sha256 of the exact bytes the page was given; a file that
+    changed underneath is a 409, never a silent overwrite
+  * secret-named values in settings documents are replaced by MASKED and put
+    back from disk on save; the raw file is sent only when the File page asks
+    (/api/scope/raw); key values are masked, one is revealed only when asked
+  * after an update or reset has run, the page must be relaunched (503)
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import secrets
+import threading
 from collections.abc import Callable
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -38,7 +46,9 @@ import yaml
 from amplifier_foundation.paths.resolution import get_amplifier_home
 
 from . import settings_web_system as system
+from .lib.env_vars import ENV_PATTERN
 from .lib.settings import AppSettings, Scope
+from .paths import is_running_from_home
 from .provider_sources import DEFAULT_PROVIDER_SOURCES
 from .settings_web_diagnose import diagnose
 from .settings_web_env import LiveEnv
@@ -51,7 +61,10 @@ UI_DIR = Path(__file__).parent / "data" / "settings_ui"
 ASSET = re.compile(r"^/((?:[a-z0-9_-]+/)*[a-z0-9_-]+\.(js|css|html))$")
 ASSET_TYPES = {"js": "text/javascript; charset=utf-8", "css": "text/css; charset=utf-8", "html": "text/html; charset=utf-8"}
 EDITABLE_SCOPES: tuple[Scope, ...] = ("global", "project", "local")
-PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+MASKED = "•••• hidden"
+HOME_SCOPE_REASON = "You're in your home folder, where project and local settings would be your global file. Run `amplifier settings` from a project folder to edit them."
+EXPIRED = "This settings page has expired. Run `amplifier settings` again to open a new one."
+RESTART = "Amplifier was updated or reset. Run amplifier settings again."
 MAX_BODY = 1_000_000
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
@@ -64,38 +77,98 @@ CSP = (
 # --------------------------------------------------------------------------
 
 
-def file_version(path: Path) -> str:
-    """Content hash of a scope file; "" when it does not exist."""
+def read_scope_file(path: Path) -> tuple[bytes | None, dict[str, Any], str | None]:
+    """(raw bytes, doc, error) from ONE read, so doc and version always agree."""
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        raw = path.read_bytes()
     except FileNotFoundError:
-        return ""
-
-
-def read_doc(path: Path) -> tuple[dict[str, Any], str | None]:
-    """Parse a scope file into (doc, error). A broken file is reported, not hidden."""
-    if not path.exists():
-        return {}, None
+        return None, {}, None
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(raw) or {}
     except yaml.YAMLError as e:
-        return {}, f"{path} is not valid YAML: {e}"
+        return raw, {}, f"{path} is not valid YAML: {e}"
     if not isinstance(data, dict):
-        return {}, f"{path} must contain a mapping at the top level"
-    return data, None
+        return raw, {}, f"{path} must contain a mapping at the top level"
+    return raw, data, None
+
+
+def version_of(raw: bytes | None) -> str:
+    """Content hash of a scope file's bytes; "" when it does not exist."""
+    return hashlib.sha256(raw).hexdigest() if raw is not None else ""
 
 
 def scope_docs(settings: AppSettings) -> list[dict[str, Any]]:
     """The parsed global, project and local documents (broken files read as empty)."""
-    return [read_doc(settings.get_scope_path(s))[0] for s in EDITABLE_SCOPES]
+    return [read_scope_file(settings.get_scope_path(s))[1] for s in EDITABLE_SCOPES]
 
 
 def placeholders(value: Any) -> set[str]:
-    """Every ${VAR} referenced anywhere in a settings value."""
+    """Every ${VAR} / ${VAR:default} referenced anywhere in a settings value."""
     if isinstance(value, str):
-        return set(PLACEHOLDER.findall(value))
+        return set(system.env_refs(value))
     items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
     return set().union(*(placeholders(v) for v in items))
+
+
+is_literal_secret = system.is_secret_value
+
+
+def mask_secrets(doc: Any, path: str = "") -> tuple[Any, list[str]]:
+    """A copy of doc with every literal secret replaced by MASKED, plus their dotted paths."""
+    if not isinstance(doc, (dict, list)):
+        return doc, []
+    out: Any = {} if isinstance(doc, dict) else []
+    masked: list[str] = []
+    for k, v in doc.items() if isinstance(doc, dict) else enumerate(doc):
+        where = f"{path}.{k}" if path else str(k)
+        if isinstance(doc, dict) and is_literal_secret(k, v):
+            new = MASKED
+            masked.append(where)
+        else:
+            new, inner = mask_secrets(v, where)
+            masked += inner
+        if isinstance(out, dict):
+            out[k] = new
+        else:
+            out.append(new)
+    return out, masked
+
+
+_MISSING = object()
+
+
+def _ident(entry: Any) -> Any:
+    """How validate_doc tells list entries apart (providers): id, else module."""
+    return (entry.get("id") or entry.get("module")) if isinstance(entry, dict) else None
+
+
+def _counterpart(old: Any, key: Any, new: Any) -> Any:
+    """The on-disk value matching new[key]; list entries are matched by identity, not index."""
+    if isinstance(old, dict):
+        return old.get(key, _MISSING)
+    if isinstance(old, list):
+        if _ident(new) is not None:
+            return next((o for o in old if _ident(o) == _ident(new)), _MISSING)
+        return old[key] if key < len(old) else _MISSING
+    return _MISSING
+
+
+def unmask_secrets(doc: Any, old: Any, path: str = "") -> None:
+    """Put back, in place, each MASKED value from the on-disk document."""
+    if not isinstance(doc, (dict, list)):
+        return
+    for k, v in list(doc.items() if isinstance(doc, dict) else enumerate(doc)):
+        where = f"{path}.{k}" if path else str(k)
+        before = _counterpart(old, k, v)
+        if v == MASKED:
+            if not isinstance(before, str):
+                raise SettingsError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    f"{where} was hidden on this page and isn't in the file any more. Type the value again.",
+                )
+            doc[k] = before
+        else:
+            unmask_secrets(v, before, where)
 
 
 def validate_doc(doc: Any) -> list[str]:
@@ -133,7 +206,7 @@ def validate_doc(doc: Any) -> list[str]:
                     errs.append(f"{where} needs a module (e.g. provider-anthropic).")
                 if "config" in p and not isinstance(p["config"], dict):
                     errs.append(f"{where}.config must be a mapping.")
-                ident = p.get("id") or p.get("module")
+                ident = _ident(p)
                 if isinstance(ident, str):
                     if ident in seen:
                         errs.append(f"Two providers share the id '{ident}'.")
@@ -143,23 +216,37 @@ def validate_doc(doc: Any) -> list[str]:
     return errs
 
 
+def scope_available(scope: Scope) -> bool:
+    """The CLI's rule (ui/scope.py): from the home folder only the global scope exists.
+
+    Paths are resolved too, so a symlinked home (or AMPLIFIER_HOME) can't make the
+    project file and the global file the same file under two names.
+    """
+    if scope == "global":
+        return True
+    project_dir = (Path.cwd() / ".amplifier").resolve()
+    return not is_running_from_home() and project_dir != get_amplifier_home().resolve()
+
+
 def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keys the page shows: everything in keys.env plus every ${VAR} settings use."""
+    """Keys the page shows: everything in keys.env plus every ${VAR} settings use.
+
+    os.environ has been synced by LiveEnv: the launch value if there was one,
+    else keys.env's. Membership counts, so an exported-but-empty variable is set.
+    """
     stored = system.read_keys_file()
     referenced = set().union(*(placeholders(d) for d in docs))
     out = []
     for name in sorted(referenced | set(stored)):
-        value = stored.get(name) or os.environ.get(name)
+        value = stored[name] if name in stored else os.environ.get(name)
         out.append(
             {
                 "name": name,
                 "stored": name in stored,
-                # KeyManager copies keys.env into the environment, so the
-                # environment only tells us something for keys not in the file
-                "in_env": name not in stored and bool(os.environ.get(name)),
+                "in_env": name not in stored and name in os.environ,
                 # Amplifier never overrides a variable already in the environment, so a
-                # different shell/launchctl value silently wins over the saved key
-                "shadowed": name in stored and bool(os.environ.get(name)) and os.environ[name] != stored[name],
+                # different launch value silently wins over the saved key
+                "shadowed": name in stored and name in os.environ and os.environ[name] != stored[name],
                 "referenced": name in referenced,
                 "secret": bool(system.SECRET_NAME.search(name)),
                 "preview": system.mask(value) if value else None,
@@ -168,66 +255,71 @@ def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def build_state(settings: AppSettings, routing: RoutingService) -> dict[str, Any]:
-    scopes, provenance = [], {}
+def sync_env(server: Any) -> None:
+    """Bring os.environ up to date with keys.env (never runs a shell)."""
+    names = set().union(*(placeholders(d) for d in scope_docs(server.settings))) | {system.NTFY_TOPIC}
+    if server.env.refresh(names):
+        server.routing.refresh()  # values changed: model lists must be fetched again
+
+
+def build_state(server: Any) -> dict[str, Any]:
+    """Everything the page shows."""
+    sync_env(server)
+    settings = server.settings
+    scopes = []
     for scope in EDITABLE_SCOPES:
         path = settings.get_scope_path(scope)
-        doc, error = read_doc(path)
-        provenance.update(dict.fromkeys(doc, scope))  # later scopes win
+        raw, doc, error = read_scope_file(path)
+        doc, masked = mask_secrets(doc)
+        available = scope_available(scope)
         scopes.append(
             {
                 "name": scope,
                 "path": str(path),
-                "exists": path.exists(),
-                "available": settings.is_scope_available(scope),
-                "version": file_version(path),
+                "exists": raw is not None,
+                "available": available,
+                "unavailable_reason": None if available else HOME_SCOPE_REASON,
+                "version": version_of(raw),
                 "doc": doc,
-                "yaml": path.read_text(encoding="utf-8") if path.exists() else "",
+                "masked": masked,
                 "error": error,
             }
         )
+    keys = key_list(scope_docs(settings))
+    defaults = system.defaults()
     try:
-        merged, merge_error = settings.get_merged_settings(), None
-    except Exception as e:  # noqa: BLE001 -- a malformed file somewhere; show it
-        merged, merge_error = {}, str(e)
-    keys = key_list([s["doc"] for s in scopes])
-    try:
-        status = system.status(settings, routing, keys, merged)
+        status = system.status(settings, server.routing, keys, settings.get_merged_settings())
     except Exception as e:  # noqa: BLE001 -- home must render even when status can't
         status = {"error": f"Couldn't work out Amplifier's status: {e}"}
+    status["jobs"] = server.jobs.info()
     return {
         "home": str(get_amplifier_home()),
-        "cwd": str(Path.cwd()),
         "scopes": scopes,
-        "effective": {
-            "doc": merged,
-            "yaml": yaml.safe_dump(merged, sort_keys=True, allow_unicode=True) if merged else "",
-            "provenance": provenance,
-            "error": merge_error,
-        },
         "keys": keys,
         "status": status,
+        "defaults": defaults,
+        "env": server.env.info(),
         "known_providers": [{"module": m, "source": s} for m, s in sorted(DEFAULT_PROVIDER_SOURCES.items())],
     }
 
 
 def _literal_secrets(doc: dict[str, Any]) -> list[tuple[int, str]]:
-    """(provider index, field) of every secret written as a literal value."""
+    """(provider index, field) of every provider secret written as a literal value."""
     out = []
     for i, entry in enumerate((doc.get("config") or {}).get("providers") or []):
         cfg = entry.get("config") if isinstance(entry, dict) else None
-        for field, value in (cfg or {}).items():
-            if isinstance(value, str) and value.strip() and system.SECRET_FIELD.search(field) and not PLACEHOLDER.fullmatch(value.strip()):
-                out.append((i, field))
+        out += [(i, f) for f, v in (cfg or {}).items() if is_literal_secret(f, v)]
     return out
 
 
-def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
+def save_scope(server: Any, body: dict[str, Any]) -> dict[str, Any]:
     settings = server.settings
     scope = body.get("scope")
     if scope not in EDITABLE_SCOPES:
         raise SettingsError(HTTPStatus.BAD_REQUEST, f"Unknown scope: {scope!r}")
     scope = cast(Scope, scope)
+    if not scope_available(scope):
+        raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, HOME_SCOPE_REASON)
     if "yaml" in body:
         try:
             doc = yaml.safe_load(body["yaml"] or "") or {}
@@ -238,15 +330,17 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
     errors = validate_doc(doc)
     if errors:
         raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Settings not saved.", errors=errors)
+    doc = cast(dict[str, Any], doc)
     path = settings.get_scope_path(scope)
     with settings.scope_lock(scope):
-        if file_version(path) != (body.get("version") or ""):
+        raw, on_disk, _ = read_scope_file(path)
+        if version_of(raw) != (body.get("version") or ""):
             raise SettingsError(
                 HTTPStatus.CONFLICT,
                 f"{path.name} changed since you opened it (another command or editor wrote it). "
                 "Reload to see the current settings.",
             )
-        doc = cast(dict[str, Any], doc)
+        unmask_secrets(doc, on_disk)
         from . import provider_config_utils
 
         # write_scope moves pasted keys to keys.env (normalize_provider_secrets),
@@ -256,15 +350,26 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
         quiet, provider_config_utils.console.quiet = provider_config_utils.console.quiet, True
         try:
             settings.write_scope(scope, doc)
+        except ValueError as e:  # e.g. no free name for a pasted key
+            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, str(e)) from e
         finally:
             provider_config_utils.console.quiet = quiet
         providers = (doc.get("config") or {}).get("providers") or []
-        moved = [m.group(1) for i, f in literals if (m := PLACEHOLDER.fullmatch(str(providers[i]["config"].get(f, ""))))]
+        moved = [n for i, f in literals for n in system.env_refs(str(providers[i]["config"].get(f, "")))[:1]]
     server.routing.refresh()  # providers may have changed: re-check model lists
-    return {**build_state(settings, server.routing), "env": server.env.info(), "moved_keys": moved}
+    return {**build_state(server), "moved_keys": moved}
 
 
-def save_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
+def scope_raw(server: Any, q: dict[str, str]) -> dict[str, Any]:
+    """The file as written, for the File page only (literal secrets included)."""
+    scope = q.get("scope")
+    if scope not in EDITABLE_SCOPES:
+        raise SettingsError(HTTPStatus.BAD_REQUEST, f"Unknown scope: {scope!r}")
+    raw = read_scope_file(server.settings.get_scope_path(cast(Scope, scope)))[0]
+    return {"yaml": (raw or b"").decode("utf-8", errors="replace"), "version": version_of(raw)}
+
+
+def save_key(server: Any, body: dict[str, Any]) -> dict[str, Any]:
     from .key_manager import KeyManager
 
     name = str(body.get("name") or "").strip()
@@ -275,56 +380,39 @@ def save_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
         raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Paste the key on its own: one line, no quotes.")
     KeyManager().save_key(name, value.strip())
     server.routing.refresh()  # a new key can make a provider's models listable
-    return {**build_state(server.settings, server.routing), "env": server.env.info()}
+    return build_state(server)
 
 
-def sync_env(server: SettingsServer, force: bool = False, shell: bool = True) -> None:
-    """Pick up keys.env changes (always) and the login shell's (first call, or `force`).
-
-    `shell=False` never runs the shell: that keeps the page's frequent poll cheap.
-    """
-    names = set().union(*(placeholders(d) for d in scope_docs(server.settings))) | {system.NTFY_TOPIC}
-    if server.env.refresh(names, force=force, shell=shell):
-        server.routing.refresh()  # values changed: model lists must be fetched again
-
-
-def state(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
-    """Everything the page shows. `?fresh=1` re-reads the login shell (the page sends it on focus)."""
-    sync_env(server, force=q.get("fresh") == "1")
-    return {**build_state(server.settings, server.routing), "env": server.env.info()}
-
-
-def changes(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+def changes(server: Any, q: dict[str, str]) -> dict[str, Any]:
     """A fingerprint of everything the page shows; it polls this to stay current. Never runs a shell."""
-    sync_env(server, shell=False)
+    sync_env(server)
     home = get_amplifier_home()
-    parts = [file_version(server.settings.get_scope_path(s)) for s in EDITABLE_SCOPES]
-    parts.append(file_version(home / "keys.env"))
+    parts = [version_of(read_scope_file(server.settings.get_scope_path(s))[0]) for s in EDITABLE_SCOPES]
+    parts.append(version_of(read_scope_file(home / "keys.env")[0]))
     parts += [f"{f.name}:{f.stat().st_mtime_ns}" for f in sorted((home / "routing").glob("*.yaml"))]
     parts.append(server.env.fingerprint)
     return {"fingerprint": hashlib.sha256("|".join(parts).encode()).hexdigest()}
 
 
-def routing_models(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+def env_reread(server: Any, body: dict[str, Any]) -> dict[str, Any]:
+    """Compare a new login shell with the launch environment. Explains; never changes os.environ."""
+    names = placeholders(scope_docs(server.settings)) | set(system.read_keys_file()) | {system.NTFY_TOPIC}
+    return server.env.reread(names)
+
+
+def routing_models(server: Any, q: dict[str, str]) -> dict[str, Any]:
     sync_env(server)
     return server.routing.models(q.get("provider", ""))
 
 
-def diagnose_provider(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
-    sync_env(server, force=True)  # diagnose what a new terminal would see right now
+def diagnose_provider(server: Any, body: dict[str, Any]) -> dict[str, Any]:
+    sync_env(server)
     return diagnose(server.settings, str(body.get("name") or ""), server.env)
 
 
-def reveal_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
+def reveal_key(server: Any, body: dict[str, Any]) -> dict[str, Any]:
     name = str(body.get("name") or "")
     return {"value": system.reveal_key(name, {k["name"] for k in key_list(scope_docs(server.settings))})}
-
-
-def provider_schema(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
-    module = q.get("module", "")
-    # the source comes from settings, never from the request
-    source = next((p.get("source") for p in server.settings.get_provider_overrides() if p.get("module") == module), None)
-    return system.provider_schema(module, source)
 
 
 # --------------------------------------------------------------------------
@@ -333,16 +421,18 @@ def provider_schema(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]
 
 Handler = Callable[["SettingsServer", Any], dict[str, Any]]
 ROUTES: dict[tuple[str, str], Handler] = {
-    ("GET", "/api/state"): state,
+    ("GET", "/api/state"): lambda s, q: build_state(s),
     ("GET", "/api/changes"): changes,
+    ("GET", "/api/scope/raw"): scope_raw,
     ("GET", "/api/reset/categories"): lambda s, q: system.reset_info(),
-    ("GET", "/api/provider-schema"): provider_schema,
+    ("GET", "/api/provider-schema"): lambda s, q: system.provider_schema(q.get("module", "")),
     ("GET", "/api/jobs"): lambda s, q: s.jobs.get(q.get("id", "")),
     ("GET", "/api/routing/matrices"): lambda s, q: {"matrices": s.routing.matrices()},
     ("GET", "/api/routing/models"): routing_models,
     ("POST", "/api/scope"): save_scope,
     ("POST", "/api/key"): save_key,
     ("POST", "/api/key/reveal"): reveal_key,
+    ("POST", "/api/env/reread"): env_reread,
     ("POST", "/api/jobs"): lambda s, b: s.jobs.start(str(b.get("kind")), b.get("options") if isinstance(b.get("options"), dict) else {}),
     ("POST", "/api/notify/test"): lambda s, b: system.notify_test(s.settings.get_merged_settings()),
     ("POST", "/api/providers/diagnose"): diagnose_provider,
@@ -353,8 +443,13 @@ ROUTES: dict[tuple[str, str], Handler] = {
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
+    # protocol_version stays the stdlib's HTTP/1.0: one request per connection.
     server: SettingsServer  # type: ignore[assignment]
-    protocol_version = "HTTP/1.1"
+    server_version, sys_version = "amplifier-settings", ""  # no Python version in headers
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Errors the stdlib raises itself (bad request line, unknown method): JSON with our headers."""
+        self._json(code, {"error": message or HTTPStatus(code).phrase})
 
     def log_message(self, format: str, *args: Any) -> None:  # quiet unless --verbose
         if self.server.verbose:
@@ -366,7 +461,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._dispatch("POST")
 
-    def _send(self, status: int, body: bytes, ctype: str, headers: dict[str, str] | None = None) -> None:
+    def _send(self, status: int, body: bytes, ctype: str) -> None:
+        if status >= 400:
+            self.close_connection = True  # whatever is left unread on the socket is discarded
         self.send_response(status)
         for k, v in {
             "Content-Type": ctype,
@@ -375,7 +472,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
             "Content-Security-Policy": CSP,
-            **(headers or {}),
         }.items():
             self.send_header(k, v)
         self.end_headers()
@@ -384,79 +480,87 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, data: Any) -> None:
         self._send(status, json.dumps(data, default=str).encode(), "application/json")
 
-    def _allowed(self, method: str) -> bool:
+    def _allowed(self) -> bool:
         h = self.headers
         return (
             h.get("Host") == self.server.host_header
             and h.get("Origin") in (None, self.server.origin)
             and h.get("Sec-Fetch-Site") in (None, "same-origin", "none")
-            and (method == "GET" or h.get("X-Amplifier-Settings") == "1")
         )
 
     def _authed(self) -> bool:
-        morsel = SimpleCookie(self.headers.get("Cookie", "")).get(self.server.cookie)
-        return morsel is not None and secrets.compare_digest(morsel.value, self.server.session)
+        sent = self.headers.get("X-Amplifier-Settings", "").encode("utf-8", "surrogatepass")
+        return hmac.compare_digest(sent, self.server.secret.encode())
+
+    def _body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY:
+                raise SettingsError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request too large.")
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError as e:  # bad length, bad JSON, bad UTF-8
+            raise SettingsError(HTTPStatus.BAD_REQUEST, "Expected a JSON object.") from e
+        if not isinstance(body, dict):
+            raise SettingsError(HTTPStatus.BAD_REQUEST, "Expected a JSON object.")
+        return body
 
     def _dispatch(self, method: str) -> None:
         url = urlsplit(self.path)
-        query = {k: v[0] for k, v in parse_qs(url.query).items()}
-        if not self._allowed(method):
+        if not self._allowed():
             return self._json(HTTPStatus.FORBIDDEN, {"error": "Request refused."})
-        if method == "GET" and url.path == "/favicon.ico":
-            return self._send(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
-        if method == "GET" and url.path == "/" and "t" in query:  # launch link -> cookie
-            if not secrets.compare_digest(query["t"], self.server.launch_token):
-                return self._json(HTTPStatus.FORBIDDEN, {"error": "This link isn't valid. Open the link `amplifier settings` printed."})
-            cookie = f"{self.server.cookie}={self.server.session}; HttpOnly; SameSite=Strict; Path=/"
-            return self._send(HTTPStatus.SEE_OTHER, b"", "text/plain", {"Location": "/", "Set-Cookie": cookie})
-        if not self._authed():
-            return self._send(HTTPStatus.UNAUTHORIZED, b"Open the link printed by `amplifier settings` to use this page.", "text/plain; charset=utf-8")
-        asset = ASSET.match("/settings.html" if url.path == "/" else url.path) if method == "GET" else None
-        if asset and (UI_DIR / asset.group(1)).is_file():
-            return self._send(HTTPStatus.OK, (UI_DIR / asset.group(1)).read_bytes(), ASSET_TYPES[asset.group(2)])
-        route = ROUTES.get((method, url.path))
-        if route is None:
+        if not url.path.startswith("/api/"):  # the page itself: public, holds nothing
+            asset = ASSET.match("/settings.html" if url.path == "/" else url.path) if method == "GET" else None
+            if asset and (UI_DIR / asset.group(1)).is_file():
+                return self._send(HTTPStatus.OK, (UI_DIR / asset.group(1)).read_bytes(), ASSET_TYPES[asset.group(2)])
+            if method == "GET" and url.path == "/favicon.ico":
+                return self._send(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
             return self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
         try:
-            arg: Any = query
-            if method == "POST":
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY:
-                    raise SettingsError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request too large.")
-                arg = json.loads(self.rfile.read(length) or b"{}")
-                if not isinstance(arg, dict):
-                    raise SettingsError(HTTPStatus.BAD_REQUEST, "Expected a JSON object.")
+            if (method, url.path) == ("POST", "/api/session"):
+                return self._json(HTTPStatus.OK, {"secret": self.server.exchange(self._body().get("token"))})
+            if not self._authed():
+                return self._json(HTTPStatus.UNAUTHORIZED, {"error": EXPIRED, "relaunch": True})
+            if self.server.jobs.restart_required and (method, url.path) != ("GET", "/api/jobs"):
+                return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": RESTART, "restart": True})
+            route = ROUTES.get((method, url.path))
+            if route is None:
+                return self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+            arg: Any = {k: v[0] for k, v in parse_qs(url.query).items()} if method == "GET" else self._body()
             self._json(HTTPStatus.OK, route(self.server, arg))
         except SettingsError as e:
             self._json(e.status, {"error": str(e), **e.extra})
-        except json.JSONDecodeError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "Expected a JSON object."})
         except Exception as e:  # noqa: BLE001 -- always answer with something readable
             logger.exception("settings page request failed")
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Something went wrong: {type(e).__name__}: {e}"})
 
 
 class SettingsServer(ThreadingHTTPServer):
+    # Request threads are daemons and never joined, so Ctrl+C can't wait on one
+    # that is stuck talking to a slow provider.
     daemon_threads = True
-    # Browsers keep idle keep-alive connections open; joining their threads on
-    # shutdown would make Ctrl+C hang forever. They're daemon threads, so they
-    # end with the process.
     block_on_close = False
 
     def __init__(self, port: int = 0, settings: AppSettings | None = None, verbose: bool = False) -> None:
         super().__init__(("127.0.0.1", port), _RequestHandler)
         self.settings = settings or AppSettings()
         self.routing = RoutingService(self.settings)
-        self.jobs = system.Jobs()
+        self.jobs = system.Jobs(cwd=os.getcwd())
         self.env = LiveEnv()
         self.verbose = verbose
-        self.launch_token = secrets.token_urlsafe(24)
-        self.session = secrets.token_urlsafe(32)
+        self.launch_token: str | None = secrets.token_urlsafe(24)
+        self.secret = secrets.token_urlsafe(32)
+        self._exchange_lock = threading.Lock()
         port = self.server_address[1]
-        self.cookie = f"amplifier_settings_{port}"  # cookies don't separate by port; names do
         self.host_header = f"127.0.0.1:{port}"
         self.origin = f"http://{self.host_header}"
+        # the token rides in the #fragment, so it never appears in a request line
+        self.launch_url = f"{self.origin}/#t={self.launch_token}"
 
-    @property
-    def launch_url(self) -> str:
-        return f"{self.origin}/?t={self.launch_token}"
+    def exchange(self, token: Any) -> str:
+        """Trade the launch token for the session secret, once."""
+        with self._exchange_lock:
+            expected = self.launch_token
+            if expected is None or not isinstance(token, str) or not hmac.compare_digest(token.encode("utf-8", "surrogatepass"), expected.encode()):
+                raise SettingsError(HTTPStatus.UNAUTHORIZED, EXPIRED, relaunch=True)
+            self.launch_token = None
+            return self.secret

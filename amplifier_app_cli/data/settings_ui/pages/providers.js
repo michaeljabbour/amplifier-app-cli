@@ -1,9 +1,9 @@
 // Providers: the AI services in priority order. Each shows the fields its module
 // declares (from /api/provider-schema) and every other config key as name/value rows.
-import { api } from "../lib/api.js";
+import { api, MASKED } from "../lib/api.js";
 import { h, btn, tag, field, textIn, switchRow, panel, kvEditor, plural, show, toast } from "../lib/dom.js";
-import { S, get, set, layered, providerName, providersIn, renumber, PLACEHOLDER, truthy, models, loadModels, paint, scopeNote } from "../lib/store.js";
-import { secretWidget } from "../lib/secret.js";
+import { S, get, set, layered, providerName, providersIn, renumber, PLACEHOLDER, truthy, models, loadModels, paint, scopeNote, defaults, hasMasked, dirty, saveDraft } from "../lib/store.js";
+import { secretWidget, newKeyWidget, envName } from "../lib/secret.js";
 import { openDiagnose } from "../lib/diagnose.js";
 import { R, ensureRouting } from "./routing.js";
 
@@ -22,10 +22,16 @@ async function loadSchema(module) {
 // provider warnings from the model check, as text
 export const warningList = (warnings) => h("ul", { class: "warnings" }, warnings.map((w) => h("li", { text: w })));
 
-function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
+// a secret written into the file comes back as MASKED; the server puts the real value
+// back on save, matched by position, so the list keeps its order while one is there
+const replacing = new Set();
+// saving the file unchanged lets the server move its pasted keys to keys.env
+const moveKeys = () => (dirty() ? toast("Save or discard your other changes first.") : saveDraft());
+
+function providerItem(p, i, ordered, commit, serves, inUseMatrix, frozen) {
   const name = providerName(p);
   const cfg = p.config || {};
-  const touch = () => set(["config", "providers"], ordered);
+  const touch = () => set(["config", "providers"], get(["config", "providers"])); // edited in place, same order
   const setCfg = (k, v) => { p.config = { ...(p.config || {}), [k]: v }; touch(); };
   const delCfg = (k) => { const c = { ...(p.config || {}) }; delete c[k]; p.config = c; touch(); paint(); };
   const schema = schemas[p.module];
@@ -39,10 +45,19 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
     const v = cfg[f.id];
     const m = typeof v === "string" && v.match(PLACEHOLDER);
     if (m) return field(label(f), secretWidget(m[1]), `Stored in keys.env as \`${m[1]}\`.`);
-    return field(label(f), textIn(v ? show(v) : "", (val) => val.trim() && setCfg(f.id, val.trim()), { type: "password", class: "code", autocomplete: "off", placeholder: "Paste a key" }),
-      v ? "Pasted into settings. It moves to keys.env when you save." : "Saved to keys.env, never to the settings file.");
+    const id = `${S.scope}:${i}:${f.id}`;
+    if (v === MASKED && !replacing.has(id)) return maskedField(f, id);
+    const place = (n) => { replacing.delete(id); setCfg(f.id, `\${${n}}`); paint(); toast(`Saved the key as \`${n}\`. Save changes to use it.`); };
+    return h("div", { class: "field" }, h("span", { text: label(f) }),
+      newKeyWidget(id, envName(name, f.id === "api_key" ? "API_KEY" : f.id), place),
+      h("small", { class: "hint", text: "The key goes to keys.env; the settings file only gets its name." }));
   };
-  const textField = (f) => field(label(f), textIn(cfg[f.id] === undefined ? "" : show(cfg[f.id]), (val) => (val.trim() ? setCfg(f.id, val.trim()) : delCfg(f.id)), { class: "code", placeholder: f.default ? `${f.default} (default)` : "default" }));
+  const maskedField = (f, id) => field(label(f),
+    h("div", { class: "secret" }, h("code", { class: "value", text: MASKED }),
+      btn("Move to keys.env", moveKeys, { icon: "key", small: true }),
+      btn("Replace", () => { replacing.add(id); paint(); }, { icon: "pencil", only: true, kind: "ghost" })),
+    "Written into this settings file, so it's hidden here.");
+  const textField = (f) => cfg[f.id] === MASKED ? secretField(f) : field(label(f), textIn(cfg[f.id] === undefined ? "" : show(cfg[f.id]), (val) => (val.trim() ? setCfg(f.id, val.trim()) : delCfg(f.id)), { class: "code", placeholder: f.default ? `${f.default} (default)` : "default" }));
   const boolField = (f) => {
     const v = cfg[f.id];
     return switchRow(label(f), f.prompt, v === undefined ? truthy(f.default) : truthy(v), (enabled) => setCfg(f.id, typeof v === "boolean" ? enabled : String(enabled)));
@@ -70,9 +85,9 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
         h("span", { class: "spacer" }),
         btn("Test connection", () => { delete models[name]; loadModels(name); paint(); }, { icon: "plug", small: true }),
         btn("Diagnose", () => openDiagnose(name), { icon: "pulse", small: true }),
-        btn(`Move ${name} up`, () => move(-1), { icon: "up", only: true, kind: "ghost", disabled: i === 0 }),
-        btn(`Move ${name} down`, () => move(1), { icon: "down", only: true, kind: "ghost", disabled: i === ordered.length - 1 }),
-        btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger" })),
+        btn(`Move ${name} up`, () => move(-1), { icon: "up", only: true, kind: "ghost", disabled: frozen || i === 0 }),
+        btn(`Move ${name} down`, () => move(1), { icon: "down", only: true, kind: "ghost", disabled: frozen || i === ordered.length - 1 }),
+        btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger", disabled: frozen })),
       ml && ml !== "loading" && !ml.models && ml.error ? h("p", { class: "notice stop", text: ml.error }) : null,
       ml && ml !== "loading" && ml.warnings?.length ? h("div", { class: "notice wait" }, warningList(ml.warnings)) : null,
       serves[name]?.length ? h("p", { class: "hint", text: `Gets the work for ${plural(serves[name].length, "role")} in ${inUseMatrix}: ${serves[name].join(", ")}.` }) : null,
@@ -97,7 +112,7 @@ export default {
       set(["config", "providers"], arr);
       paint();
     };
-    const inUseMatrix = layered(["routing", "matrix"]).val || "balanced";
+    const inUseMatrix = layered(["routing", "matrix"]).val || defaults().matrix;
     const serves = {};
     if (R.result?.roles && R.result.matrix === inUseMatrix) for (const r of R.result.roles) if (r.winner !== null) (serves[r.candidates[r.winner].provider] ||= []).push(r.name);
     ensureRouting();
@@ -106,6 +121,7 @@ export default {
     const mod = h("select", { "aria-label": "Provider type" }, known.map((k) => h("option", { value: k.module, text: k.module.replace(/^provider-/, "") })));
     const id = h("input", { type: "text", placeholder: "e.g. anthropic-work", "aria-label": "Name" });
     const model = h("input", { type: "text", class: "code", placeholder: "optional", "aria-label": "Default model" });
+    const frozen = hasMasked(get(["config", "providers"]));
     const add = () => {
       const k = known.find((x) => x.module === mod.value);
       const nm = id.value.trim() || k.module.replace(/^provider-/, "");
@@ -115,11 +131,14 @@ export default {
     };
     return [
       scopeNote(),
+      frozen ? h("div", { class: "notice wait" },
+        h("p", { text: "This file has a key written into it. Move it to keys.env to keep it out of the file; until then, providers here can't be added, removed or reordered." }),
+        h("div", { class: "actions" }, btn("Move to keys.env", moveKeys, { icon: "key", small: true, kind: "primary" }))) : null,
       ordered.length
-        ? h("ol", { class: "panel chainlist" }, ordered.map((p, i) => providerItem(p, i, ordered, commit, serves, inUseMatrix)))
+        ? h("ol", { class: "panel chainlist" }, ordered.map((p, i) => providerItem(p, i, ordered, commit, serves, inUseMatrix, frozen)))
         : h("p", { class: "notice", text: S.scope === "global" ? "No providers yet. Add your first one below." : "This file doesn't change any providers." }),
       panel("Add a provider", "Amplifier installs it the next time it starts. For sign-in providers like ChatGPT or Copilot, use `amplifier provider add`.",
-        h("div", { class: "pad" }, h("div", { class: "fields" }, field("Type", mod), field("Name", id), field("Default model", model)), h("div", { class: "actions" }, btn("Add provider", add, { icon: "plus", kind: "primary" })))),
+        h("div", { class: "pad" }, h("div", { class: "fields" }, field("Type", mod), field("Name", id), field("Default model", model)), h("div", { class: "actions" }, btn("Add provider", add, { icon: "plus", kind: "primary", disabled: frozen })))),
     ];
   },
 };

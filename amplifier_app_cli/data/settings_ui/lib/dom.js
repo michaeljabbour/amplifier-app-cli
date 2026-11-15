@@ -1,4 +1,5 @@
 // DOM helpers. All text enters the DOM as text nodes; `md` turns `backticks` into <code>.
+import { MASKED } from "./api.js";
 
 // Icons: 24px grid, 2px stroke. Strings are paths; [cx, cy, r] are circles.
 const ICONS = {
@@ -112,7 +113,9 @@ export function kvEditor(entries, { onSet, onDel, onAdd, addLabel = "Add option"
   return h("div", { class: "kv" },
     entries.map(([k, v]) => [
       h("span", { class: "k" }, h("code", { text: k })),
-      typeof v === "boolean"
+      v === MASKED // a secret in the file: never edited here, the server keeps it as it is
+        ? h("code", { class: "value", title: "A secret written into this settings file", text: MASKED })
+        : typeof v === "boolean"
         ? h("span", {}, h("input", { type: "checkbox", role: "switch", checked: v, "aria-label": k, onchange: (e) => onSet(k, e.target.checked) }))
         : textIn(v === null || v === undefined ? "" : show(v), (val) => onSet(k, parseValue(val, v)), { class: "code", "aria-label": k }),
       btn(`Remove ${k}`, () => onDel(k), { icon: "trash", only: true, kind: "ghost danger" }),
@@ -122,7 +125,7 @@ export function kvEditor(entries, { onSet, onDel, onAdd, addLabel = "Add option"
 
 export function toast(msg) {
   const t = h("div", { md: msg });
-  $("toast").append(t);
+  $("toast")?.append(t);
   setTimeout(() => t.remove(), 4000);
 }
 

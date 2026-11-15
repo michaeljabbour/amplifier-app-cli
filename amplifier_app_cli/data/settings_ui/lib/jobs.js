@@ -1,7 +1,7 @@
 // Background commands (update check, update, reset plan, reset) and their console.
 import { api } from "./api.js";
 import { h, lamp, toast } from "./dom.js";
-import { paint, refreshStatus } from "./store.js";
+import { S, paint, refreshStatus } from "./store.js";
 
 export const jobs = {};
 
@@ -24,6 +24,12 @@ async function pollJob(kind) {
   if (jobs[kind].running) setTimeout(() => pollJob(kind), 800);
   else if (kind.startsWith("update")) refreshStatus();
 }
+
+// why update and reset can't run from this page, or null when they can
+export const jobsOff = () => {
+  const j = S.state?.status?.jobs;
+  return j && !j.enabled ? j.reason || "Update and reset are turned off for this settings page." : null;
+};
 
 export const confirmUpdate = () => {
   if (confirm("Update Amplifier now? It replaces the program running this page, so you'll reopen it with `amplifier settings` when it's done.")) startJob("update");

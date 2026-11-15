@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import signal
+import sys
 import webbrowser
 
 import click
@@ -29,7 +31,8 @@ def settings(port: int, no_browser: bool, verbose: bool) -> None:
     `amplifier routing`: ~/.amplifier/settings.yaml (global) and, when run
     inside a project, .amplifier/settings.yaml (project) and
     .amplifier/settings.local.yaml (local). The page is served on 127.0.0.1
-    only and stops when you press Ctrl+C.
+    only and stops when you press Ctrl+C. The printed link works once: open
+    it again and the page asks you to run `amplifier settings` again.
     """
     from ..settings_web import SettingsServer
     from .provider import _ensure_providers_ready
@@ -59,3 +62,8 @@ def settings(port: int, no_browser: bool, verbose: bool) -> None:
         console.print("\nSettings page stopped.")
     finally:
         server.server_close()
+    # A request thread may still be waiting on a provider that isn't answering;
+    # exiting normally would join it. Nothing else is left to clean up.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

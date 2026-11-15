@@ -261,6 +261,8 @@ details[open] > summary { margin-bottom: 10px; }
 .secret { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 4px; align-items: center; }
 .secret .value { padding: 7px 10px; background: var(--sunk); border-radius: 7px; overflow-wrap: anywhere; min-height: 36px; display: flex; align-items: center; }
 .secret .value.empty { color: var(--ink-2); font-family: var(--ui); }
+.newkey { display: flex; flex-direction: column; gap: 6px; }
+.newkey-name { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: center; }
 .keycard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 8px 20px; padding: 14px 20px; align-items: center; }
 .keycard + .keycard { border-top: 1px solid var(--rule); }
 .keycard .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -338,7 +340,12 @@ dialog.diag::backdrop { background: rgb(0 0 0 / .45); }
 .diag-steps li > .lamp { margin-top: 5px; }
 .diag-steps p { color: var(--ink-2); overflow-wrap: anywhere; }
 table.mini { border-collapse: collapse; margin-top: 8px; font-size: 13px; width: 100%; }
-table.mini td { padding: 5px 10px 5px 0; vertical-align: top; overflow-wrap: anywhere; }
+table.mini td, table.mini th { padding: 5px 10px 5px 0; vertical-align: top; overflow-wrap: anywhere; }
+table.mini th { text-align: left; font-weight: 600; color: var(--ink-2); }
 table.mini tr + tr td { border-top: 1px solid var(--rule); }
 pre.log { margin: 8px 0 0; padding: 10px 12px; background: #111214; color: #d9dbe0; border-radius: 7px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
 .diag-foot { padding: 14px 20px; border-top: 1px solid var(--rule); position: sticky; bottom: 0; background: var(--panel); }
+
+/* the page after its session ended */
+main.halted { max-width: 640px; padding-top: 96px; }
+main.halted h1 { font-size: 22px; }

@@ -12,9 +12,16 @@ from amplifier_app_cli.lib.settings import AppSettings, SettingsPaths
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import settings_web_env
     from amplifier_app_cli.commands import routing
 
     monkeypatch.setattr(routing, "_ensure_routing_bundle_cached", lambda: None)
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_SHELL_ENV", "off")  # no test starts $SHELL
+
+    def no_shell(*a: object, **kw: object) -> None:
+        raise AssertionError("diagnose must not start a login shell")
+
+    monkeypatch.setattr(settings_web_env, "_run_shell", no_shell)
 
 
 @pytest.fixture
@@ -38,17 +45,27 @@ def test_diagnose_explains_each_step_and_never_leaks_keys(home: Path, tmp_path: 
     proj = tmp_path / "p3" / ".amplifier"
     proj.mkdir(parents=True)
     settings = AppSettings(SettingsPaths(home / "settings.yaml", proj / "settings.yaml", proj / "settings.local.yaml"))
-    report = diagnose(settings, "demo")
+    report = diagnose(settings, "demo", FakeEnv())  # no re-read yet: nothing asks the shell
     steps = {s["name"]: s for s in report["steps"]}
     assert steps["Provider code"]["status"] == "fail"
     assert any("provider install" in t for t in report["tips"])
     assert "DEMO_URL" in steps["Settings"]["summary"]  # unset variable is named
     assert steps["API key"]["status"] == "warn" and "two different values" in steps["API key"]["summary"]
     wheres = [s["where"] for s in steps["API key"]["sources"]]
-    assert wheres[0] == "keys.env" and wheres[1].startswith("your ")  # names the shell file when it can
+    assert wheres == ["keys.env", "your environment (the shell, launchctl or the program that started this page)"]
     assert steps["Key check"]["status"] == "skip" and steps["Through Amplifier"]["status"] == "skip"
     assert "saved-value" not in str(report) and "shell-value" not in str(report)
     assert diagnose(settings, "missing")["steps"][0]["status"] == "fail"
+
+
+class FakeEnv:
+    """LiveEnv as the contract has it: shell_value() is None until the user asks for a re-read."""
+
+    def __init__(self, shell: dict[str, str] | None = None) -> None:
+        self.shell = shell or {}
+
+    def shell_value(self, name: str) -> str | None:
+        return self.shell.get(name)
 
 
 def _demo_settings(home: Path, tmp_path: Path) -> AppSettings:
@@ -88,7 +105,7 @@ def test_diagnose_key_check_reads_status_from_exception_chain(home: Path, tmp_pa
         raise AuthenticationError(f"Incorrect API key provided: {shell}") from HTTPStatusError("401 Unauthorized")
 
     monkeypatch.setattr(provider_loader, "get_provider_models", fake_models)
-    report = diagnose(_demo_settings(home, tmp_path), "demo")
+    report = diagnose(_demo_settings(home, tmp_path), "demo", FakeEnv({"DEMO_KEY": shell}))  # after a re-read
     steps = {s["name"]: s for s in report["steps"]}
     assert calls == [shell, saved, "${DEMO_KEY}"]  # each candidate, then as configured
     check = steps["Key check"]
@@ -116,3 +133,28 @@ def test_diagnose_all_ok_when_key_works(home: Path, tmp_path: Path, monkeypatch:
     assert [s["name"] for s in report["steps"]] == ["Provider code", "Settings", "API key", "Key check", "Through Amplifier"]
     assert "Everything checks out" in report["tips"][0]
     assert "saved-value" not in str(report)
+
+
+def test_exported_but_empty_variable_is_what_amplifier_uses(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli.settings_web_diagnose import diagnose
+
+    (home / "keys.env").write_text('DEMO_KEY="saved-value-abcdef123456"\n')
+    monkeypatch.setenv("DEMO_KEY", "")  # set, so the runtime never loads keys.env's value
+    report = diagnose(_demo_settings(home, tmp_path), "demo")
+    key = next(s for s in report["steps"] if s["name"] == "API key")
+    assert key["status"] == "fail" and "set but empty" in key["summary"]
+
+
+def test_settings_step_reads_defaults_like_the_runtime(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli.settings_web_diagnose import diagnose
+
+    monkeypatch.delenv("DEMO_URL", raising=False)
+    (home / "settings.yaml").write_text(
+        yaml.safe_dump({"config": {"providers": [{"id": "demo", "module": "provider-nothing-here", "config": {"base_url": "${DEMO_URL:http://localhost:9/v1}"}}]}})
+    )
+    proj = tmp_path / "p5" / ".amplifier"
+    proj.mkdir(parents=True)
+    settings = AppSettings(SettingsPaths(home / "settings.yaml", proj / "settings.yaml", proj / "settings.local.yaml"))
+    step = next(s for s in diagnose(settings, "demo")["steps"] if s["name"] == "Settings")
+    assert step["summary"] == "Calls http://localhost:9/v1."
+    assert step["config"]["base_url"]["resolved"] == "http://localhost:9/v1"

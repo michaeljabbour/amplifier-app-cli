@@ -9,7 +9,6 @@ results, and every candidate key value is masked before the report is returned.
 
 from __future__ import annotations
 
-import concurrent.futures
 import importlib.metadata
 import json
 import logging
@@ -18,11 +17,11 @@ import re
 import time
 from typing import Any
 
+from .lib.env_vars import ENV_PATTERN
 from .lib.settings import AppSettings
 from .provider_manager import resolve_provider_entry
-from .settings_web_system import SECRET_FIELD, mask, read_keys_file
+from .settings_web_system import SECRET_FIELD, SECRET_NAME, env_refs, is_secret_value, mask, read_keys_file, run_with_timeout
 
-VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 KEYLIKE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-\.]{8,})")
 LOGGERS = ("httpx", "httpx2", "httpcore.connection", "httpcore2.connection", "openai", "anthropic", "google_genai", "ollama")
 KEY_TIMEOUT_S = 20.0
@@ -37,11 +36,12 @@ def _scrub(text: str, secrets: list[str]) -> str:
 
 
 def _resolve(value: Any) -> tuple[Any, list[str], list[str]]:
-    """Expand ${VAR} the way the provider will (from the environment)."""
+    """Expand ${VAR} and ${VAR:default} as the runtime does (lib/env_vars.py): value, names, unset names."""
     if not isinstance(value, str):
         return value, [], []
-    names = VAR.findall(value)
-    return VAR.sub(lambda m: os.environ.get(m.group(1), ""), value), names, [n for n in names if not os.environ.get(n)]
+    found = list(ENV_PATTERN.finditer(value))
+    resolved = ENV_PATTERN.sub(lambda m: os.environ.get(m.group(1), m.group(2) or ""), value)
+    return resolved, [m.group(1) for m in found], [m.group(1) for m in found if m.group(1) not in os.environ and m.group(2) is None]
 
 
 def _step(name: str, status: str, summary: str, **detail: Any) -> dict[str, Any]:
@@ -69,31 +69,31 @@ def _list_models(module: str, cfg: dict[str, Any], timeout: float) -> dict[str, 
     from .provider_loader import get_provider_models
 
     t0 = time.monotonic()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        models = pool.submit(get_provider_models, module, collected_config=cfg, require_catalog=True).result(timeout=timeout)
+        models = run_with_timeout(lambda: get_provider_models(module, collected_config=cfg, require_catalog=True), timeout)
         ids = [str(getattr(m, "id", None) or m) for m in models]
         return {"http": 200, "seconds": round(time.monotonic() - t0, 2), "models": len(ids), "ids": ids}
-    except concurrent.futures.TimeoutError:
+    except TimeoutError:
         return {"http": None, "seconds": round(time.monotonic() - t0, 2), "message": f"No answer within {timeout:.0f} seconds."}
     except Exception as e:  # noqa: BLE001 -- this is the error we're here to show
         status, url = _http_of(e)
         cause = e.__cause__ or e.__context__
         why = f" (caused by {type(cause).__name__}: {cause})" if cause and str(cause) not in str(e) else ""
         return {"http": status, "seconds": round(time.monotonic() - t0, 2), "message": f"{type(e).__name__}: {e}{why}"[:400], "url": url, "error_type": type(e).__name__}
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _key_sources(var: str, file_val: str | None, env_val: str | None, live_env: Any) -> tuple[list[dict[str, Any]], list[str]]:
-    sources = [{"where": "keys.env", "preview": mask(file_val), "length": len(file_val)}] if file_val else []
+    sources = [{"where": "keys.env", "preview": mask(file_val), "length": len(file_val)}] if file_val is not None else []
     set_by: list[str] = []
-    if env_val and env_val != file_val:
-        from .settings_web_env import where_set
-
-        set_by = where_set(var)
+    if env_val is not None and env_val != file_val:
+        # The login shell only explains, and only after the user asked for a re-read:
+        # shell_value() is None until then, so no shell is started from here.
         from_shell = live_env is not None and live_env.shell_value(var) == env_val
-        where = f"your shell ({', '.join(set_by)})" if set_by else "your shell startup files" if from_shell else "your environment (launchctl or the program that started this page)"
+        if from_shell:
+            from .settings_web_env import where_set
+
+            set_by = where_set(var)
+        where = f"your shell ({', '.join(set_by)})" if set_by else "your shell startup files" if from_shell else "your environment (the shell, launchctl or the program that started this page)"
         sources.append({"where": where, "preview": mask(env_val), "length": len(env_val)})
     return sources, set_by
 
@@ -127,6 +127,9 @@ def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str
     for k, v in sorted(cfg.items()):
         if not SECRET_FIELD.search(k):
             resolved, names, missing = _resolve(v)
+            hide = is_secret_value(k, v) or any(SECRET_NAME.search(n) for n in names) or is_secret_value(k, resolved)
+            if hide:  # a key behind a harmless-looking field, or a password in a URL
+                v, resolved = (mask(v) if is_secret_value(k, v) else v), mask(str(resolved))
             shown[k] = {"value": v, "resolved": resolved if names else None}
             unset += missing
     base = str(_resolve(cfg.get("base_url"))[0] or "").strip()
@@ -138,7 +141,7 @@ def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str
     # 3. API key
     key_field = next((str(k) for k in cfg if SECRET_FIELD.search(str(k))), None)
     raw = cfg.get(key_field) if key_field else None
-    var = (VAR.findall(raw) or [None])[0] if isinstance(raw, str) else None
+    var = (env_refs(raw) or [None])[0] if isinstance(raw, str) else None
     candidates: list[tuple[str, str]] = []
     set_by: list[str] = []
     if key_field is None:
@@ -149,15 +152,16 @@ def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str
     else:
         env_val, file_val = os.environ.get(var), read_keys_file().get(var)
         sources, set_by = _key_sources(var, file_val, env_val, live_env)
-        used = env_val or file_val
+        used = env_val if env_val is not None else file_val  # a set variable wins even if empty, as at runtime
         if not used:
-            steps["API key"] = _step("API key", "fail", f"`{var}` is empty: it's not in keys.env or your environment.", variable=var, sources=sources)
-            tips.append(f"Add `{var}` on the API keys page.")
-        elif env_val and file_val and env_val != file_val:
+            why = "it's set but empty in your environment, and Amplifier never overrides a set variable" if env_val == "" else "it's not in keys.env or your environment"
+            steps["API key"] = _step("API key", "fail", f"`{var}` is empty: {why}.", variable=var, sources=sources)
+            tips.append(f"Add `{var}` on the API keys page." if env_val is None else f"Unset the empty `{var}` in your environment, then restart `amplifier settings`.")
+        elif env_val is not None and file_val is not None and env_val != file_val:
             steps["API key"] = _step("API key", "warn", f"`{var}` has two different values. Amplifier uses the one from your environment, because it never overrides an existing variable.", variable=var, sources=sources, used="your environment", set_by=set_by)
             candidates = [("from your environment (the one in use)", env_val), ("from keys.env", file_val)]
         else:
-            where = "keys.env" if file_val else "your environment"
+            where = "keys.env" if env_val is None or env_val == file_val else "your environment"
             steps["API key"] = _step("API key", "ok", f"`{var}` comes from {where} ({mask(used)}, {len(used)} characters).", variable=var, sources=sources, used=where)
             candidates = [(f"from {where}", used)]
     secrets = [v for _, v in candidates]
@@ -181,7 +185,7 @@ def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str
         if first["http"] in (401, 403) and works:
             v = var or "the key"
             if set_by:
-                tips.insert(0, f"The saved key in keys.env works; the one set in {', '.join(set_by)} doesn't. Update or remove `export {v}=` there. This page picks the change up by itself within a few seconds.")
+                tips.insert(0, f"The saved key in keys.env works; the one set in {', '.join(set_by)} doesn't. Update or remove `export {v}=` there, then restart `amplifier settings` from a new terminal.")
             else:
                 tips.insert(0, f"The saved key in keys.env works; the one in your environment doesn't. Run `launchctl unsetenv {v}` (macOS), then restart `amplifier settings` from a new terminal.")
         elif first["http"] in (401, 403):

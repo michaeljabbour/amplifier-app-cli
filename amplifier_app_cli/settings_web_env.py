@@ -1,17 +1,21 @@
 """Keep the settings server's view of keys and environment current, without restarts.
 
-The page answers "what will Amplifier see the next time I run it?". Two sources
-feed that answer, and they cost very different amounts to read:
+The page answers "what will Amplifier see when it runs from here?". Amplifier
+only reads its process environment, filled in by KeyManager from keys.env for
+names the environment doesn't already have. So:
 
-  * keys.env -- a small file, re-read on every refresh (the page polls often);
-  * the user's login shell (`$SHELL -ilc 'env -0'`, the trick editors use) --
-    slow, so it is read once at the first refresh and again only on `force=True`
-    (the page forces on window focus and before diagnosing a provider).
+  * the environment this server was launched with is the truth. A name in it
+    (even exported as "") keeps its launch value;
+  * keys.env is re-read on every refresh (the page polls), so a key saved
+    elsewhere needs no restart; a name that leaves keys.env and was not in the
+    launch environment is removed.
 
-Amplifier's rule is applied to every variable settings or keys.env mention: a
-value from the shell wins, otherwise keys.env (KeyManager never overrides a set
-variable); a name neither has is removed. Without a shell snapshot (turned off,
-or it failed), the environment this process started with stands in for it.
+KeyManager has already copied keys.env into os.environ by the time the server
+starts, so a launch value equal to keys.env's is taken to have come from it.
+
+The user's login shell (`$SHELL -ilc 'env -0'`) is read only when the page
+asks (POST /api/env/reread). It explains why a new terminal would see something
+different, and where its startup files set a name; it never changes os.environ.
 """
 
 from __future__ import annotations
@@ -84,47 +88,60 @@ def where_set(name: str) -> list[str]:
 class LiveEnv:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._base: dict[str, str] | None = None  # shell snapshot, or the launch environment
+        stored = read_keys_file()
+        self._launch = {k: v for k, v in os.environ.items() if stored.get(k) != v}
+        self._names: set[str] = set()  # every name refresh() has managed
         self._shell: dict[str, str] | None = None
-        self.shell_error: str | None = None
-        self.shell_read_at: float | None = None
+        self.reread_at: float | None = None
+        self.differences: list[dict[str, Any]] = []
         self.fingerprint = ""
 
-    def refresh(self, names: set[str], force: bool = False, *, shell: bool = True) -> bool:
-        """Bring os.environ up to date for `names`; return True if anything changed.
-
-        keys.env is always re-read. The login shell is read at the first refresh
-        and when `force` is set -- never when `shell` is False.
-        """
+    def refresh(self, names: set[str]) -> bool:
+        """Bring os.environ up to date for `names` and keys.env; return True if anything changed."""
         with self._lock:
             stored = read_keys_file()
-            if self._base is None:
-                # values equal to keys.env were most likely loaded from it at launch
-                self._base = {k: v for k, v in os.environ.items() if stored.get(k) != v}
-            if shell and (force or self.shell_read_at is None and self.shell_error is None):
-                self._read_shell()
-            for name in names | set(stored):
-                value = self._base.get(name) or stored.get(name)
-                if value:
-                    os.environ[name] = value
+            self._names |= names | set(stored)
+            for name in self._names:
+                if name in self._launch:
+                    os.environ[name] = self._launch[name]
+                elif name in stored:
+                    os.environ[name] = stored[name]
                 else:
                     os.environ.pop(name, None)
-            digest = hashlib.sha256("\0".join(f"{n}={os.environ.get(n, '')}" for n in sorted(names | set(stored))).encode()).hexdigest()
+            digest = hashlib.sha256("\0".join(f"{n}={os.environ.get(n)}" for n in sorted(self._names)).encode()).hexdigest()
             changed, self.fingerprint = digest != self.fingerprint, digest
             return changed
 
-    def _read_shell(self) -> None:
+    def reread(self, names: set[str]) -> dict[str, Any]:
+        """Where a new login shell would give `names` different values than this server has.
+
+        Only set/unset is reported, never values.
+        """
+        if not shell_env_enabled():
+            return {"differences": [], "error": "Reading your login shell is turned off here (AMPLIFIER_SETTINGS_SHELL_ENV=off)."}
         try:
-            if not shell_env_enabled():
-                raise RuntimeError("reading your login shell is turned off (AMPLIFIER_SETTINGS_SHELL_ENV=off)")
-            self._shell = self._base = login_shell_env()
-            self.shell_error, self.shell_read_at = None, time.time()
+            shell = login_shell_env()
         except (OSError, subprocess.SubprocessError, RuntimeError) as e:
-            self.shell_error = f"Couldn't read your login shell's environment ({e}); using the last known values."
+            return {"differences": [], "error": f"Couldn't read your login shell's environment: {e}"}
+        stored = read_keys_file()
+        diffs = [
+            {
+                "name": n,
+                "launch": "set" if n in self._launch else "unset",
+                "shell": "set" if n in shell else "unset",
+                "where": where_set(n) if n in shell else [],
+            }
+            for n in sorted(names)
+            # compare what Amplifier would end up with: the environment's value, else keys.env's
+            if self._launch.get(n, stored.get(n)) != shell.get(n, stored.get(n))
+        ]
+        with self._lock:
+            self._shell, self.differences, self.reread_at = shell, diffs, time.time()
+        return {"differences": diffs, "error": None}
 
     def shell_value(self, name: str) -> str | None:
-        """What a new terminal sets `name` to (None if it doesn't, or unknown)."""
+        """What a new terminal sets `name` to; None if it doesn't, or no re-read happened."""
         return (self._shell or {}).get(name)
 
     def info(self) -> dict[str, Any]:
-        return {"shell_read_at": self.shell_read_at, "shell_error": self.shell_error}
+        return {"source": "launch", "reread_at": self.reread_at, "differences": self.differences}

@@ -10,7 +10,6 @@ failure reason, and saving a whole matrix the way `amplifier routing create` doe
 
 from __future__ import annotations
 
-import concurrent.futures
 import copy
 import datetime
 import logging
@@ -25,10 +24,12 @@ from typing import Any
 from .commands import routing as cli
 from .lib.routing_provenance import resolve_matrix_origins
 from .lib.settings import AppSettings, get_custom_routing_dir
-from .settings_web_system import SettingsError
+from .settings_web_system import SettingsError, run_with_timeout
 from .utils.atomic_write import atomic_write_yaml
 
-MATRIX_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+# hooks-routing's validate_matrix_name (matrix_loader.py) accepts [a-z][a-z0-9_-]*; the hook isn't
+# importable outside a session, so the pattern is repeated here, capped at 64 characters.
+MATRIX_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 REQUIRED_ROLES = ("general", "fast")
 EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
@@ -99,7 +100,7 @@ class RoutingService:
 
     @staticmethod
     def _load() -> tuple[list[Path], dict[str, Any], dict[str, tuple[dict[str, Any], Path]]]:
-        files = cli._discover_matrix_files()
+        files = cli._discover_matrix_files(fetch=False)  # never download from a request
         origins = resolve_matrix_origins(files)
         return files, origins, cli._load_all_matrices_with_paths(files, origins)
 
@@ -219,26 +220,23 @@ class RoutingService:
             timeout = float(os.environ.get("AMPLIFIER_ROUTING_LIST_TIMEOUT", cli._LIVE_LIST_TIMEOUT_S))
         except ValueError:
             timeout = cli._LIVE_LIST_TIMEOUT_S
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        models, error = None, None
         started = time.monotonic()
+        models, error = None, None
         try:
-            models = pool.submit(fetch).result(timeout=timeout * 2)
-        except concurrent.futures.TimeoutError:
+            models = run_with_timeout(fetch, timeout * 2)
+        except TimeoutError:
             error = "The provider didn't answer in time."
         except ModelCatalogUnavailable as e:
             error = f"{e}. Amplifier can't load this provider's code outside a session, so its models can't be listed here (sessions are not affected)."
         except Exception as e:  # noqa: BLE001 -- auth / network errors: show the provider's own words
             error = f"{type(e).__name__}: {e}"[:300]
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
         return {"provider": provider, "models": models, "error": error, "warnings": warnings, "seconds": round(time.monotonic() - started, 1)}
 
     # -- `amplifier routing create` -------------------------------------------
     def save_matrix(self, body: dict[str, Any]) -> dict[str, Any]:
         name = str(body.get("name") or "").strip()
         if not MATRIX_NAME.match(name):
-            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Use letters, numbers, hyphens and underscores for the name (up to 64), starting with a letter or number.")
+            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Use lowercase letters, numbers, hyphens and underscores for the name (up to 64), starting with a letter.")
         roles = body.get("roles") if isinstance(body.get("roles"), dict) else {}
         missing = [r for r in REQUIRED_ROLES if r not in roles]
         if missing:
@@ -263,8 +261,10 @@ class RoutingService:
         return {"name": name, "path": str(target)}
 
     def delete_matrix(self, name: str) -> dict[str, Any]:
-        target = get_custom_routing_dir() / f"{name}.yaml"
-        if not MATRIX_NAME.match(name) or not target.is_file():
+        custom = get_custom_routing_dir()
+        target = custom / f"{name}.yaml"
+        # any file of yours, including one named before the hook's rule; never a path outside the folder
+        if target.parent != custom or not target.is_file():
             raise SettingsError(HTTPStatus.NOT_FOUND, "Only matrices you created can be deleted.")
         target.unlink()
         return {"ok": True}

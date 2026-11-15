@@ -1,11 +1,12 @@
 // Routing: preview a matrix, see which model gets each role, pin models, save as a matrix.
 import { api } from "../lib/api.js";
 import { h, icon, btn, link, lamp, tag, field, switchRow, lede, toast } from "../lib/dom.js";
-import { S, SCOPES, set, del, clone, prune, layered, layeredOverrides, models, loadModels, paint, on } from "../lib/store.js";
+import { S, SCOPES, set, del, clone, prune, layered, layeredOverrides, models, loadModels, paint, on, defaults } from "../lib/store.js";
 
 // view state, not settings
-export const R = { matrices: null, preview: null, result: null, live: true, busy: false, open: new Set(), pinning: null, pinForm: null, arrive: true, seq: 0 };
-const inUse = () => layered(["routing", "matrix"]).val || "balanced";
+// `loadError`: the matrix list couldn't be read; it is fetched again only on Retry
+export const R = { matrices: null, preview: null, result: null, live: true, busy: false, open: new Set(), pinning: null, pinForm: null, arrive: true, seq: 0, loadError: null };
+const inUse = () => layered(["routing", "matrix"]).val || defaults().matrix;
 
 export async function refreshRouting({ matrices = false } = {}) {
   const seq = ++R.seq;
@@ -15,8 +16,9 @@ export async function refreshRouting({ matrices = false } = {}) {
     if (!R.preview || !R.matrices.some((m) => m.name === R.preview)) R.preview = inUse();
     const { overrides } = layeredOverrides();
     paint("routing");
-    // fast offline pass first, then the live check (a few seconds per provider at most)
-    for (const live of R.live ? [false, true] : [false]) {
+    // fast offline pass first, then the live check (a few seconds per provider at most).
+    // Live checks send each provider its key, so they only run on this page.
+    for (const live of R.live && S.tab === "routing" ? [false, true] : [false]) {
       const res = await api("/api/routing/resolve", { matrix: R.preview, overrides, live });
       if (seq !== R.seq) return;
       R.result = res;
@@ -24,14 +26,15 @@ export async function refreshRouting({ matrices = false } = {}) {
     }
   } catch (e) {
     if (seq !== R.seq) return;
-    R.result = { error: e.message, matrix: R.preview };
+    if (R.matrices) R.result = { error: e.message, matrix: R.preview };
+    else R.loadError = e.message;
   }
   R.busy = false;
   paint("routing", "providers", "home");
 }
 // new files or a different draft: work it out again once the board has been opened
 on("adopt", (fromServer) => { if (R.matrices) refreshRouting({ matrices: fromServer }); });
-export const ensureRouting = () => { if (!R.matrices && !R.busy) refreshRouting(); };
+export const ensureRouting = () => { if (!R.matrices && !R.busy && !R.loadError) refreshRouting(); };
 
 function previewMatrix(name) {
   Object.assign(R, { preview: name, pinning: null, pinForm: null, arrive: true });
@@ -227,15 +230,16 @@ function boardFoot(res, m) {
 
 export default {
   id: "routing", title: "Routing", crumb: "Which model does each kind of work.", group: "Models", icon: "route", scoped: true,
-  arrive() { R.arrive = true; },
+  arrive() { R.arrive = true; if (R.matrices && R.live) setTimeout(() => refreshRouting()); }, // after S.tab is set: the live check runs here only
   view() {
     const intro = lede("Amplifier gives every task a role, like coding, quick lookups or deep reasoning. A routing matrix lists the models to try for each role, in order; the first one you can use gets the work.");
+    if (R.loadError) return [intro, h("div", { class: "notice stop" }, h("p", { md: R.loadError }), btn("Try again", () => { R.loadError = null; refreshRouting(); }, { icon: "refresh", small: true }))];
     if (!R.matrices) {
       ensureRouting();
       return [intro, h("p", { class: "quiet-note", text: "Reading your routing matrices…" })];
     }
     if (!R.matrices.length) return [intro, h("p", { class: "notice wait", md: "No routing matrices are downloaded yet. Run `amplifier routing list` once to fetch them, then reload this page." })];
-    const { val, from } = layered(["routing", "matrix"]);
-    return [intro, plates(val || "balanced"), board(val || "balanced", from)];
+    const { from } = layered(["routing", "matrix"]);
+    return [intro, plates(inUse()), board(inUse(), from)];
   },
 };
