@@ -302,3 +302,34 @@ def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict
         "updates": {"hours_ago": hours_ago, "every_hours": upd.get("check_frequency_hours")},
         "unread_top_level": sorted(k for k in merged if k not in CLI_TOP_LEVEL_KEYS),
     }
+
+
+# ---------------------------------------------------------------- phone test
+NTFY_TOPIC = "AMPLIFIER_NTFY_TOPIC"  # same variable `amplifier notify ntfy` uses
+
+
+def notify_test(merged: dict[str, Any]) -> dict[str, Any]:
+    """Send one test notification the way hooks-notify-push will (ntfy POST)."""
+    import urllib.error
+    import urllib.request
+
+    topic = read_keys_file().get(NTFY_TOPIC) or os.environ.get(NTFY_TOPIC)
+    if not topic:
+        raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Create a channel first.")
+    cfg = (merged.get("config") or {}).get("notifications") or {}
+    server = str((cfg.get("ntfy") or {}).get("server") or (cfg.get("push") or {}).get("server") or "https://ntfy.sh").rstrip("/")
+    if not server.startswith(("http://", "https://")):
+        raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, f"The ntfy server must be an http(s) URL, not {server}.")
+    req = urllib.request.Request(
+        f"{server}/{topic}",
+        data="If you can read this, Amplifier can reach your phone.".encode(),
+        headers={"Title": "Amplifier test notification", "Tags": "white_check_mark"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 -- http(s) checked above
+            return {"ok": True, "status": r.status, "server": server}
+    except urllib.error.HTTPError as e:
+        raise SettingsError(HTTPStatus.BAD_GATEWAY, f"{server} answered {e.code}. Check the channel name and server.") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise SettingsError(HTTPStatus.BAD_GATEWAY, f"Couldn't reach {server}: {getattr(e, 'reason', e)}") from e

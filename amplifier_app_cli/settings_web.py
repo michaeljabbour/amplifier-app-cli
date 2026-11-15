@@ -40,6 +40,7 @@ from amplifier_foundation.paths.resolution import get_amplifier_home
 from . import settings_web_system as system
 from .lib.settings import AppSettings, Scope
 from .provider_sources import DEFAULT_PROVIDER_SOURCES
+from .settings_web_diagnose import diagnose
 from .settings_web_routing import RoutingService
 from .settings_web_system import SettingsError
 
@@ -328,6 +329,8 @@ ROUTES: dict[tuple[str, str], Handler] = {
     ("POST", "/api/key"): save_key,
     ("POST", "/api/key/reveal"): reveal_key,
     ("POST", "/api/jobs"): lambda s, b: s.jobs.start(str(b.get("kind")), b.get("options") if isinstance(b.get("options"), dict) else {}),
+    ("POST", "/api/notify/test"): lambda s, b: system.notify_test(s.settings.get_merged_settings()),
+    ("POST", "/api/providers/diagnose"): lambda s, b: diagnose(s.settings, str(b.get("name") or "")),
     ("POST", "/api/routing/resolve"): lambda s, b: s.routing.resolve(str(b.get("matrix") or ""), b.get("overrides") or {}, bool(b.get("live"))),
     ("POST", "/api/routing/matrix"): lambda s, b: s.routing.save_matrix(b),
     ("POST", "/api/routing/matrix/delete"): lambda s, b: s.routing.delete_matrix(str(b.get("name") or "")),

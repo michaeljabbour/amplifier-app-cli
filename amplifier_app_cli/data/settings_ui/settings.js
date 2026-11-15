@@ -65,6 +65,8 @@ const ICONS = {
   play: ["M7 4l13 8-13 8z"],
   chevron: ["M9 6l6 6-6 6"],
   save: ["M5 3h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M7 3v5h8", "M7 21v-7h10v7"],
+  copy: ["M9 9h11v11H9z", "M5 15H4V4h11v1"],
+  pulse: ["M22 12h-4l-3 9L9 3l-3 9H2"],
 };
 
 // ================================================================ state
@@ -410,7 +412,8 @@ function connectionsPanel(st) {
         h("div", { class: `hint${!checking && !ok ? " bad" : ""}`, text: detail }),
         !checking && ml.warnings?.length ? warningList(ml.warnings, p.name) : null),
       h("div", { class: "row-actions" },
-        !checking && !ok ? (p.missing_keys.length ? link("Add key", "#keys", { icon: "key", kind: "small primary" }) : link("Fix", "#providers", { icon: "pencil", kind: "small" })) : null,
+        !checking && !ok ? (p.missing_keys.length ? link("Add key", "#keys", { icon: "key", kind: "small primary" }) : btn("Diagnose", () => openDiagnose(p.name), { icon: "pulse", small: true, kind: "primary" })) : null,
+        ok ? btn(`Diagnose ${p.name}`, () => openDiagnose(p.name), { icon: "pulse", only: true, kind: "ghost" }) : null,
         btn(`Test ${p.name} again`, () => { delete R.models[p.name]; renderMain(); }, { icon: "refresh", only: true, kind: "ghost", disabled: checking })));
   });
   return h("section", { class: "panel" },
@@ -738,6 +741,54 @@ function boardFoot(res, m) {
     m?.origin === "yours" ? btn("Delete this matrix", remove, { icon: "trash", kind: "danger" }) : null);
 }
 
+// ================================================================ DIAGNOSE
+const DIAG_LAMP = { ok: "winner", warn: "winner unverified", fail: "dead", skip: "unconfigured" };
+function diagnoseText(r) {
+  const lines = [`Amplifier provider diagnosis: ${r.provider} (${r.module || "?"}), ${r.seconds}s`, ""];
+  for (const s of r.steps) {
+    lines.push(`[${s.status.toUpperCase()}] ${s.name}: ${s.summary}`);
+    for (const x of s.sources || []) lines.push(`    key from ${x.where}: ${x.preview} (${x.length} chars)`);
+    for (const x of s.results || []) lines.push(`    ${x.key}: HTTP ${x.http ?? "none"} in ${x.seconds}s${x.models != null ? `, ${x.models} models` : ""}${x.message ? ` - ${x.message}` : ""}`);
+    for (const [k, v] of Object.entries(s.config || {})) lines.push(`    ${k}: ${show(v.value)}${v.resolved != null ? ` -> ${show(v.resolved) || "(empty)"}` : ""}`);
+    for (const l of s.log || []) lines.push(`    log: ${l}`);
+  }
+  if (r.tips.length) lines.push("", "What to try:", ...r.tips.map((t) => `- ${t}`));
+  return lines.join("\n");
+}
+function openDiagnose(name) {
+  const dlg = h("dialog", { class: "diag", "aria-label": `Diagnosis for ${name}` });
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  const run = async () => {
+    paint(null);
+    try { paint(await api("/api/providers/diagnose", { name })); } catch (e) { paint({ error: e.message }); }
+  };
+  const paint = (r) => {
+    const head = h("header", { class: "diag-head" }, h("h2", { text: `Diagnosing ${name}` }), btn("Close", () => dlg.close(), { icon: "x", only: true, kind: "ghost" }));
+    if (!r) return dlg.replaceChildren(head, h("p", { class: "pad quiet-note", text: "Running checks: provider code, settings, key, a direct call to the API, then the same call through Amplifier. This can take up to 45 seconds." }));
+    if (r.error) return dlg.replaceChildren(head, h("p", { class: "notice stop", md: r.error }));
+    const failing = r.steps.some((s) => s.status === "fail");
+    dlg.replaceChildren(head,
+      r.tips.length ? h("section", { class: `notice ${failing ? "stop" : "wait"} tips` }, h("strong", { text: "What to try" }), h("ul", {}, r.tips.map((t) => h("li", { md: t })))) : null,
+      h("ol", { class: "diag-steps" }, r.steps.map((s) => h("li", {},
+        lamp(DIAG_LAMP[s.status] || "fallback"),
+        h("div", { class: "row-main" },
+          h("strong", { text: s.name }),
+          h("p", { md: s.summary }),
+          s.sources?.length ? h("table", { class: "mini" }, h("tbody", {}, s.sources.map((x) => h("tr", {}, h("td", { text: `From ${x.where}` }), h("td", {}, h("code", { text: x.preview })), h("td", { text: `${x.length} characters` }))))) : null,
+          s.results?.length ? h("table", { class: "mini" }, h("tbody", {}, s.results.map((x) => h("tr", {}, h("td", { text: `Key ${x.key}` }), h("td", {}, tag(x.http ? `HTTP ${x.http}` : "no answer", x.http >= 200 && x.http < 300 ? "lit" : "stop")), h("td", { text: `${x.seconds}s` }), h("td", { text: x.models != null ? `${x.models} models` : x.message || "" }))))) : null,
+          s.config && Object.keys(s.config).length ? h("details", {}, h("summary", { text: "Settings it uses" }), h("table", { class: "mini" }, h("tbody", {}, Object.entries(s.config).map(([k, v]) => h("tr", {}, h("td", {}, h("code", { text: k })), h("td", {}, h("code", { text: show(v.value) })), h("td", { text: v.resolved != null ? `→ ${show(v.resolved) || "(not set)"}` : "" })))))) : null,
+          s.log?.length ? h("details", { open: s.status === "fail" }, h("summary", { text: `Provider log (${s.log.length} lines)` }), h("pre", { class: "log", text: s.log.join("\n") })) : null)))),
+      h("footer", { class: "actions diag-foot" },
+        btn("Copy report", () => navigator.clipboard.writeText(diagnoseText(r)).then(() => toast("Copied. Secrets are masked.")), { icon: "copy" }),
+        btn("Run again", run, { icon: "refresh" }),
+        h("span", { class: "spacer" }),
+        h("span", { class: "hint", text: `Took ${r.seconds}s` })));
+  };
+  dlg.showModal();
+  run();
+}
+
 // ================================================================ PROVIDERS
 async function loadSchema(module) {
   if (P.schemas[module]) return;
@@ -785,6 +836,7 @@ function secretWidget(name, emptyText = "Not set") {
   return h("div", { class: "secret" },
     h("code", { class: `value${has ? "" : " empty"}`, title: has ? (info.stored ? "Saved in keys.env" : "Set in the shell that started this page") : null, text: shown ?? (has ? info.preview : emptyText) }),
     has ? btn(shown !== undefined ? "Hide" : "Show", toggleShow, { icon: shown !== undefined ? "eyeOff" : "eye", only: true, kind: "ghost", "aria-pressed": String(shown !== undefined) }) : null,
+    shown !== undefined ? btn("Copy", () => navigator.clipboard.writeText(shown).then(() => toast("Copied.")), { icon: "copy", only: true, kind: "ghost" }) : null,
     btn(has ? "Change" : SECRET_NAME.test(name) ? "Add key" : "Set", () => { P.editingKey = name; renderMain(); }, has ? { icon: "pencil", only: true, kind: "ghost" } : { icon: "plus", kind: SECRET_NAME.test(name) ? "primary" : "" }));
 }
 
@@ -862,6 +914,7 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
         connTag,
         h("span", { class: "spacer" }),
         btn("Test connection", () => { delete R.models[name]; loadModels(name); renderMain(); }, { icon: "plug", small: true }),
+        btn("Diagnose", () => openDiagnose(name), { icon: "pulse", small: true }),
         btn(`Move ${name} up`, () => { const a = [...ordered]; [a[i - 1], a[i]] = [a[i], a[i - 1]]; commit(a); }, { icon: "up", only: true, kind: "ghost", disabled: i === 0 }),
         btn(`Move ${name} down`, () => { const a = [...ordered]; [a[i + 1], a[i]] = [a[i], a[i + 1]]; commit(a); }, { icon: "down", only: true, kind: "ghost", disabled: i === ordered.length - 1 }),
         btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger" })),
@@ -972,21 +1025,37 @@ function notifyControls(doc, apply) {
   const topic = state.keys.find((k) => k.name === NTFY_TOPIC);
   const hasTopic = Boolean(topic && (topic.stored || topic.in_env));
   const setPush = (on) => apply((d) => { setIn(d, [...NOTIFY, "ntfy", "enabled"], on); delIn(d, [...NOTIFY, "push", "enabled"]); });
+  // ntfy delivers to a channel name you make up; whoever knows the name gets the messages
+  const createChannel = async () => {
+    const letters = "abcdefghijkmnpqrstuvwxyz23456789";
+    const name = `amplifier-${Array.from(crypto.getRandomValues(new Uint8Array(14)), (b) => letters[b % letters.length]).join("")}`;
+    try {
+      const st = await api("/api/key", { name: NTFY_TOPIC, value: name });
+      Object.assign(state, { keys: st.keys, status: st.status });
+      P.revealed[NTFY_TOPIC] = name; // show it, so it can be copied into the app
+      toast("Created your private channel. Now subscribe to it in the ntfy app.");
+      setPush(true);
+    } catch (e) { toast(e.message); }
+  };
+  const sendTest = async () => {
+    try {
+      await api("/api/notify/test", {});
+      toast("Sent. It should arrive on your phone within a few seconds.");
+    } catch (e) { toast(e.message); }
+  };
   return [
     switchRow("Desktop notifications", "A notification on this computer when the assistant finishes and is waiting for you.", desktopOn, (on) => apply((d) => setIn(d, [...NOTIFY, "desktop", "enabled"], on))),
-    switchRow("Phone notifications", "Through the free ntfy app: install it, then subscribe to the topic below.", pushOn, (on) => {
-      if (on && !hasTopic) {
-        P.editingKey = NTFY_TOPIC;
-        P.afterKey = { name: NTFY_TOPIC, run: () => setPush(true) }; // switch on once the topic is saved
-        renderMain();
-        return toast("Choose a topic first. Make it long and hard to guess.");
-      }
-      setPush(on);
-    }),
-    pushOn || hasTopic || P.editingKey === NTFY_TOPIC
-      ? field("Phone topic", secretWidget(NTFY_TOPIC, "No topic yet"), "Anyone who knows your topic can read your notifications, so it's kept in keys.env, never in settings.")
+    switchRow("Phone notifications", "A push notification on your phone, through the free ntfy app.", pushOn, (on) => (on && !hasTopic ? createChannel() : setPush(on))),
+    pushOn || hasTopic
+      ? h("div", { class: "phone-setup" },
+          h("ol", { class: "howto" },
+            h("li", {}, "Install the free ntfy app for ", h("a", { href: "https://apps.apple.com/app/ntfy/id1625396347", target: "_blank", rel: "noreferrer", text: "iPhone" }), " or ", h("a", { href: "https://play.google.com/store/apps/details?id=io.heckel.ntfy", target: "_blank", rel: "noreferrer", text: "Android" }), "."),
+            h("li", { text: "In the app, tap + and subscribe to your private channel name below. Use the eye to see it, then copy it." }),
+            h("li", { text: "Send a test to check it arrives." })),
+          hasTopic ? field("Your private channel", secretWidget(NTFY_TOPIC, "No channel yet")) : btn("Create a private channel", createChannel, { icon: "plus", kind: "primary" }),
+          h("p", { class: "hint", text: "Treat the channel name like a password: anyone who knows it can read your notifications. It's kept in keys.env, never in your settings." }),
+          hasTopic ? h("div", { class: "actions" }, btn("Send a test notification", sendTest, { icon: "bell" })) : null)
       : null,
-    pushOn && !hasTopic ? h("p", { class: "notice wait", text: "Phone notifications are on but have no topic, so nothing will be sent. Add a topic above." }) : null,
   ];
 }
 VIEWS.notifications = () => [

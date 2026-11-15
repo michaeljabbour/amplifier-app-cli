@@ -262,7 +262,7 @@ details[open] > summary { margin-bottom: 10px; }
 .adder { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 12px 20px 16px; }
 .adder.two { grid-template-columns: minmax(120px, 200px) minmax(0, 1fr) auto; }
 
-.secret { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px; align-items: center; }
+.secret { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 4px; align-items: center; }
 .secret .value { padding: 7px 10px; background: var(--sunk); border-radius: 7px; overflow-wrap: anywhere; min-height: 36px; display: flex; align-items: center; }
 .secret .value.empty { color: var(--ink-2); font-family: var(--ui); }
 .keycard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 8px 20px; padding: 14px 20px; align-items: center; }
@@ -324,3 +324,27 @@ textarea.yaml:focus { outline-offset: -2px; }
   .kv, .two, .adder.two, .keycard { grid-template-columns: 1fr; }
   input, select, textarea { font-size: 16px; }
 }
+
+/* ---------- phone setup ---------- */
+.phone-setup { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; background: var(--sunk); border-radius: var(--r); }
+.howto { margin: 0; padding-left: 20px; color: var(--ink-2); }
+.howto li + li { margin-top: 4px; }
+.howto a { color: var(--ink); font-weight: 600; }
+
+/* ---------- diagnose dialog ---------- */
+dialog.diag { width: min(880px, 94vw); max-height: 86vh; overflow: auto; padding: 0; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 60px rgb(0 0 0 / .35); }
+dialog.diag::backdrop { background: rgb(0 0 0 / .45); }
+.diag-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--rule); position: sticky; top: 0; background: var(--panel); }
+.diag-head h2 { font-size: 18px; }
+.diag .tips { margin: 16px 20px 0; flex-direction: column; align-items: flex-start; }
+.diag .tips ul { margin: 4px 0 0; padding-left: 18px; }
+.diag-steps { list-style: none; margin: 0; padding: 8px 0; }
+.diag-steps li { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 12px; padding: 12px 20px; }
+.diag-steps li + li { border-top: 1px solid var(--rule); }
+.diag-steps li > .lamp { margin-top: 5px; }
+.diag-steps p { color: var(--ink-2); overflow-wrap: anywhere; }
+table.mini { border-collapse: collapse; margin-top: 8px; font-size: 13px; width: 100%; }
+table.mini td { padding: 5px 10px 5px 0; vertical-align: top; overflow-wrap: anywhere; }
+table.mini tr + tr td { border-top: 1px solid var(--rule); }
+pre.log { margin: 8px 0 0; padding: 10px 12px; background: #111214; color: #d9dbe0; border-radius: 7px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.diag-foot { padding: 14px 20px; border-top: 1px solid var(--rule); position: sticky; bottom: 0; background: var(--panel); }
