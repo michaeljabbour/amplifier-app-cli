@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -67,23 +66,36 @@ def test_reset_categories_report_sizes(home: Path) -> None:
     assert not cats["projects"]["default_remove"]
 
 
-def test_provider_schema_is_read_from_source_without_importing_it(home: Path) -> None:
-    pkg = home / "cache" / "amplifier-module-provider-demo-0123456789abcdef" / "amplifier_module_provider_demo"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text(
-        "import a_dependency_that_is_not_installed\n"
-        "FIELDS = [\n"
-        "  ConfigField(id='api_key', display_name='API Key', field_type='secret', prompt='Key'),\n"
-        "  ConfigField(id='effort', display_name='Effort', field_type='choice', choices=['low', 'high'], prompt='E'),\n"
-        "]\n"
-        "def f(config):\n"
-        "    return config.get('max_tokens'), config.get('thinking_budget_tokens')\n"
-    )
-    schema = system.provider_schema("provider-demo")
-    assert schema["origin"] == "source"
-    assert [f["id"] for f in schema["fields"]] == ["api_key", "effort"]
-    assert schema["fields"][1]["choices"] == ["low", "high"]
-    assert {"max_tokens", "thinking_budget_tokens"} <= set(schema["reads"])
+def test_provider_schema_comes_only_from_the_providers_declarations(monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import provider_loader
+
+    declared = {
+        "provider-demo": {
+            "config_fields": [
+                {"id": "api_key", "display_name": "API Key", "field_type": "secret", "prompt": "Key", "env_var": "X"},
+                {"id": "effort", "display_name": "Effort", "field_type": "choice", "choices": ["low", "high"], "default": None},
+            ]
+        },
+    }
+    calls: list[tuple[str, object]] = []
+
+    def fake_info(module_id: str, *, source_path: Path | None = None) -> dict | None:
+        calls.append((module_id, source_path))
+        return declared.get(module_id)
+
+    monkeypatch.setattr(provider_loader, "get_provider_info", fake_info)
+
+    schema = system.provider_schema("provider-demo", "git+https://example.invalid/demo")
+    assert schema == {
+        "fields": [
+            {"id": "api_key", "display_name": "API Key", "field_type": "secret", "prompt": "Key"},
+            {"id": "effort", "display_name": "Effort", "field_type": "choice", "choices": ["low", "high"]},
+        ],
+        "origin": "provider",
+    }
+    assert system.provider_schema("provider-unknown") == {"fields": [], "origin": "none"}
+    system.provider_schema("provider-demo", "file:///tmp/demo-checkout")
+    assert calls[-1] == ("provider-demo", Path("/tmp/demo-checkout"))  # a local checkout loads from its root
 
 
 def test_status_flags_missing_keys(home: Path, tmp_path: Path) -> None:
@@ -91,7 +103,7 @@ def test_status_flags_missing_keys(home: Path, tmp_path: Path) -> None:
         yaml.safe_dump(
             {
                 "max_iterations": 200,
-                "config": {"providers": [{"id": "a", "module": "provider-anthropic", "config": {"api_key": "${MY_KEY}"}}]},
+                "config": {"providers": [{"id": "a", "module": "provider-anthropic", "config": {"api_key": "${MY_KEY}", "base_url": "${UNSET_BASE_URL}"}}]},
             }
         )
     )
@@ -119,7 +131,6 @@ def test_environment_value_shadowing_a_saved_key_is_flagged(home: Path, tmp_path
     assert key["shadowed"] and key["stored"]
     assert state["status"]["providers"][0]["shadowed_keys"] == ["MY_KEY"]
     assert "stale-shell" not in str(state) and "saved-good" not in str(state)  # neither value leaks
-
 
 
 def test_notify_test_needs_a_channel(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

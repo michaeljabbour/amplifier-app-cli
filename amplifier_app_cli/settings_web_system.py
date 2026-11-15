@@ -1,9 +1,7 @@
 """Machine-level pieces of the settings page: keys, provider schemas, status, jobs.
 
 * Key values are masked everywhere; one is revealed only on request.
-* Provider settings come from the provider's own ConfigField declarations. When
-  its code can't be imported here (its SDK lives only in a session's
-  environment) they're read from the cached source with `ast` -- parsed, never run.
+* Provider settings come only from the provider's own ConfigField declarations.
 * Update and reset run the real `amplifier update` / `amplifier reset` from a
   fixed allow-list. They replace the program serving the page, so they start
   detached and log to a private folder that outlives the server.
@@ -11,7 +9,6 @@
 
 from __future__ import annotations
 
-import ast
 import os
 import re
 import subprocess
@@ -33,7 +30,6 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_FIELD = re.compile(r"(api_key|token|secret|password)$", re.IGNORECASE)  # config field names
 SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$", re.IGNORECASE)  # environment variable names
 PLACEHOLDER_ONLY = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
-
 
 
 class SettingsError(Exception):
@@ -75,66 +71,24 @@ def reveal_key(name: str, allowed: set[str]) -> str:
 
 
 # ---------------------------------------------------------------- provider schema
-def _provider_source_dir(module_id: str, source: str | None) -> Path | None:
-    """A provider's checkout: a file:// source from settings, else the newest cache dir."""
-    if source and source.startswith("file://"):
-        p = Path(source.removeprefix("file://"))
-        return p if p.is_dir() else None
-    cache = get_amplifier_home() / "cache"
-    pattern = re.compile(rf"^amplifier-module-{re.escape(module_id)}-[0-9a-f]{{8,}}$")
-    dirs = [d for d in cache.iterdir() if d.is_dir() and pattern.match(d.name)] if cache.is_dir() else []
-    return max(dirs, key=lambda d: d.stat().st_mtime) if dirs else None
-
-
-def _literal(node: ast.AST) -> Any:
-    try:
-        return ast.literal_eval(node)
-    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-        return None
+_FIELD_KEYS = ("id", "display_name", "field_type", "prompt", "choices", "default")
 
 
 def provider_schema(module_id: str, source: str | None = None) -> dict[str, Any]:
-    """{fields: ConfigField-like dicts, reads: config keys the code reads, origin}."""
-    fields: list[dict[str, Any]] = []
-    origin = "none"
-    try:  # importable: ask the provider itself
-        from .provider_loader import get_provider_info
+    """{fields, origin}: the provider's own ConfigField declarations, nothing inferred.
 
-        info = get_provider_info(module_id) or {}
-        fields = [dict(f) for f in info.get("config_fields") or []]
-        origin = "provider" if fields else origin
-    except Exception:  # noqa: BLE001 -- best effort; the source is the fallback
-        fields = []
-    reads: set[str] = set()
-    src = _provider_source_dir(module_id, source)
-    for py in src.rglob("*.py") if src else ():
-        if any(part.startswith("test") for part in py.relative_to(src).parts):  # type: ignore[arg-type]
-            continue
-        try:
-            text = py.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        reads.update(re.findall(r"config\.get\(\s*[\"']([a-z_][a-z0-9_]*)[\"']", text))
-        if origin == "provider" or "ConfigField(" not in text:
-            continue
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "ConfigField":
-                f = {kw.arg: _literal(kw.value) for kw in node.keywords if kw.arg}
-                if isinstance(f.get("id"), str):
-                    fields.append(f)
-    if fields and origin == "none":
-        origin = "source"
-    seen: set[str] = set()
-    keep = ("id", "display_name", "field_type", "prompt", "choices", "default")
-    return {
-        "fields": [{k: f[k] for k in keep if f.get(k) is not None} for f in fields if not (f["id"] in seen or seen.add(f["id"]))],
-        "reads": sorted(reads - {"priority", "raw", "filtered"}),
-        "origin": origin,
-    }
+    `source` is the module's `source` from settings; a file:// checkout is loaded from
+    that root, anything else through normal discovery (startup repairs the modules).
+    """
+    from .provider_loader import get_provider_info
+
+    path = Path(source.removeprefix("file://")) if source and source.startswith("file://") else None
+    try:
+        info = (get_provider_info(module_id, source_path=path) if path else get_provider_info(module_id)) or {}
+    except Exception:  # noqa: BLE001 -- an unloadable provider just has no form
+        info = {}
+    fields = [{k: f[k] for k in _FIELD_KEYS if f.get(k) is not None} for f in info.get("config_fields") or [] if f.get("id")]
+    return {"fields": fields, "origin": "provider" if fields else "none"}
 
 
 # ---------------------------------------------------------------- reset
@@ -255,19 +209,23 @@ def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict
     except Exception:  # noqa: BLE001
         version = {"display": "unknown", "core": ""}
 
-    have_key = {k["name"] for k in keys if k["stored"] or k["in_env"]}
+    have = {k["name"] for k in keys if k["stored"] or k["in_env"]}
+    shadowed = {k["name"] for k in keys if k.get("shadowed")}
     providers = []
     for i, p in enumerate(settings.get_provider_overrides()):
         cfg = p.get("config") or {}
-        missing = [
-            m.group(1)
-            for k, v in cfg.items()
-            if SECRET_FIELD.search(k) and isinstance(v, str)
-            for m in [PLACEHOLDER_ONLY.match(v)]
-            if m and m.group(1) not in have_key
-        ]
-        shadowed = [k["name"] for k in keys if k.get("shadowed") and any(f"${{{k['name']}}}" == v for v in cfg.values())]
-        providers.append({"name": routing.provider_name(p), "model": cfg.get("default_model"), "default": i == 0, "missing_keys": missing, "shadowed_keys": shadowed})
+        # ${NAME} references by field. An unset *secret* is a real problem; an unset
+        # optional value such as `base_url: ${ANTHROPIC_BASE_URL}` just means "use the
+        # provider's default", so only secrets count as missing. An environment value
+        # overriding a saved one matters for any field.
+        refs = {k: m.group(1) for k, v in cfg.items() if isinstance(v, str) and (m := PLACEHOLDER_ONLY.match(v))}
+        providers.append({
+            "name": routing.provider_name(p),
+            "model": cfg.get("default_model"),
+            "default": i == 0,
+            "missing_keys": [n for k, n in refs.items() if SECRET_FIELD.search(k) and n not in have],
+            "shadowed_keys": [n for n in refs.values() if n in shadowed],
+        })  # fmt: skip
 
     rcfg = merged.get("routing") or {}
     route: dict[str, Any] = {"matrix": rcfg.get("matrix", "balanced")}
