@@ -2,7 +2,7 @@
 
 The browser edits one *scope document* at a time -- the parsed YAML of the
 global, project or local settings file -- and saves the whole document back
-through ``AppSettings._write_scope``, the same funnel every CLI command uses.
+through ``AppSettings.write_scope``, the same funnel every CLI command uses.
 So atomic writes and plaintext-secret normalization apply exactly as they do
 for `amplifier provider`. Every form on the page is a view over that document.
 
@@ -211,43 +211,15 @@ def build_state(settings: AppSettings, routing: RoutingService) -> dict[str, Any
     }
 
 
-def secure_literal_secrets(settings: AppSettings, doc: dict[str, Any], scope: Scope) -> list[str]:
-    """Move literal secrets in provider config into keys.env; return the names written.
-
-    The CLI's ``normalize_provider_secrets`` (also run by ``_write_scope``) skips,
-    with only a console warning, any provider whose module can't load in this
-    process -- a browser user would never see that warning and the key would land
-    in settings.yaml. So run it first (its naming wins whenever it can act), then
-    move any literal it left behind to ``AMPLIFIER_<ID>_<FIELD>``, the convention
-    shared with amplifier-unified, never reusing a name that holds another value.
-    """
-    from .key_manager import KeyManager
-    from .provider_config_utils import normalize_provider_secrets
-
-    try:
-        normalize_provider_secrets(settings, doc, scope)
-    except Exception as e:  # noqa: BLE001 -- the fallback below still guarantees no literal
-        logger.debug(f"normalize_provider_secrets failed; using fallback: {e}")
-    written: list[str] = []
-    for entry in (doc.get("config") or {}).get("providers") or []:
+def _literal_secrets(doc: dict[str, Any]) -> list[tuple[int, str]]:
+    """(provider index, field) of every secret written as a literal value."""
+    out = []
+    for i, entry in enumerate((doc.get("config") or {}).get("providers") or []):
         cfg = entry.get("config") if isinstance(entry, dict) else None
-        if not isinstance(cfg, dict):
-            continue
-        ident = re.sub(r"[^A-Za-z0-9]+", "_", str(entry.get("id") or entry.get("module"))).strip("_")
-        for field, value in list(cfg.items()):
-            if not (isinstance(value, str) and value.strip() and system.SECRET_FIELD.search(field)):
-                continue
-            if PLACEHOLDER.fullmatch(value.strip()):
-                continue
-            stored = system.read_keys_file()
-            base = name = f"AMPLIFIER_{ident}_{field}".upper()
-            n = 2
-            while stored.get(name, value.strip()) != value.strip():  # taken by another value
-                name, n = f"{base}_{n}", n + 1
-            KeyManager().save_key(name, value.strip())
-            cfg[field] = "${" + name + "}"
-            written.append(name)
-    return written
+        for field, value in (cfg or {}).items():
+            if isinstance(value, str) and value.strip() and system.SECRET_FIELD.search(field) and not PLACEHOLDER.fullmatch(value.strip()):
+                out.append((i, field))
+    return out
 
 
 def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
@@ -267,7 +239,7 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
     if errors:
         raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Settings not saved.", errors=errors)
     path = settings.get_scope_path(scope)
-    with settings._scope_lock(scope):
+    with settings.scope_lock(scope):
         if file_version(path) != (body.get("version") or ""):
             raise SettingsError(
                 HTTPStatus.CONFLICT,
@@ -277,14 +249,17 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
         doc = cast(dict[str, Any], doc)
         from . import provider_config_utils
 
-        # its "could not resolve provider module" warnings would print to the
-        # terminal on every save; the page reports problems itself
+        # write_scope moves pasted keys to keys.env (normalize_provider_secrets),
+        # replacing each literal with ${NAME}; note which ones, to tell the user.
+        # Its console notes would print to the terminal on every save.
+        literals = _literal_secrets(doc)
         quiet, provider_config_utils.console.quiet = provider_config_utils.console.quiet, True
         try:
-            moved = secure_literal_secrets(settings, doc, scope)
-            settings._write_scope(scope, doc)
+            settings.write_scope(scope, doc)
         finally:
             provider_config_utils.console.quiet = quiet
+        providers = (doc.get("config") or {}).get("providers") or []
+        moved = [m.group(1) for i, f in literals if (m := PLACEHOLDER.fullmatch(str(providers[i]["config"].get(f, ""))))]
     server.routing.refresh()  # providers may have changed: re-check model lists
     return {**build_state(settings, server.routing), "env": server.env.info(), "moved_keys": moved}
 

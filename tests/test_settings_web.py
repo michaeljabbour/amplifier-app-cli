@@ -127,9 +127,10 @@ def test_pasted_secret_never_lands_in_yaml(settings: AppSettings, home: Path) ->
     st = save_scope(_srv(settings), {"scope": "global", "doc": doc, "version": ""})
     raw = settings.paths.global_settings.read_text()
     assert "sk-literal-123" not in raw
-    assert "${AMPLIFIER_MY_LLM_API_KEY}" in raw
+    # the CLI's own write path moved it (even though the provider can't load here)
+    [name] = st["moved_keys"]
+    assert f"${{{name}}}" in raw
     assert "sk-literal-123" in (home / "keys.env").read_text()
-    assert st["moved_keys"] == ["AMPLIFIER_MY_LLM_API_KEY"]
     assert "sk-literal-123" not in json.dumps(st, default=str)
 
 
@@ -257,6 +258,19 @@ def test_only_state_fresh_and_diagnose_rerun_the_shell(server: SettingsServer, s
 
 def test_static_assets_ship_with_package() -> None:
     ui = Path(__file__).parents[1] / "amplifier_app_cli" / "data" / "settings_ui"
-    for name in ("settings.html", "settings.css", "settings.js"):
+    for name in ("settings.html", "settings.css", "app.js"):
         assert (ui / name).is_file()
+    # every module app.js (transitively) imports exists, so the page can't 404 on a module
+    import re
+
+    seen, todo = set(), ["app.js"]
+    while todo:
+        rel = todo.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        path = ui / rel
+        assert path.is_file(), rel
+        for spec in re.findall(r"""from\s+["'](\.{1,2}/[^"']+)["']""", path.read_text()):
+            todo.append(str((path.parent / spec).resolve().relative_to(ui.resolve())))
     assert "<script>" not in (ui / "settings.html").read_text()  # CSP: no inline script

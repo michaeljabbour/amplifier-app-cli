@@ -49,16 +49,11 @@ def mask(value: str) -> str:
 
 
 def read_keys_file() -> dict[str, str]:
-    """name -> value from keys.env (KeyManager only exposes names)."""
-    path = get_amplifier_home() / "keys.env"
-    out: dict[str, str] = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
+    """name -> value saved in keys.env (independent of the environment)."""
+    from .key_manager import KeyManager
+
+    km = KeyManager()
+    return {name: value for name in km.stored_keys() if (value := km.get_stored(name)) is not None}
 
 
 def reveal_key(name: str, allowed: set[str]) -> str:
