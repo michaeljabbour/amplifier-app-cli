@@ -1,35 +1,21 @@
 """Step-by-step connection diagnosis for one provider (the page's "Diagnose").
 
-Answers "why can't Amplifier reach this provider?" the way a person would
-check by hand, and shows its working:
-
-  1. provider code   -- is the module installed and loadable here?
-  2. settings        -- what config will it run with, with ${VAR}s resolved?
-  3. API key         -- which variable, where its value comes from (keys.env vs
-                        the environment), and whether the two disagree
-  4. direct check    -- call the provider's model-list endpoint ourselves with
-                        each candidate key: HTTP status and the provider's message
-  5. via Amplifier   -- the same call `amplifier provider test` makes, with a
-                        longer timeout and the provider/HTTP logs captured
-                        (retries, status codes) instead of discarded
-  6. what to try     -- suggestions derived from 1-5
-
-Secrets never leave masked: key values, Authorization headers and anything
-key-shaped in captured logs are replaced before the report is returned.
+Steps: Provider code, Settings (${VAR}s resolved), API key (keys.env vs the
+environment), Key check (the provider lists models once per candidate key) and
+Through Amplifier (as configured; log lines are captured for display only).
+HTTP status and URL come from the exception chain, tips from those structured
+results, and every candidate key value is masked before the report is returned.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import importlib.metadata
-import importlib.util
 import json
 import logging
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from typing import Any
 
 from .lib.settings import AppSettings
@@ -37,27 +23,10 @@ from .provider_manager import resolve_provider_entry
 from .settings_web_system import SECRET_FIELD, mask, read_keys_file
 
 VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-KEYLIKE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-\.]{8,}|x-api-key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_\-]{8,})")
-# What to listen to while the provider runs, and which lines are worth showing.
-# httpx2/httpcore2 are the copies of httpx/httpcore bundled with Amplifier.
-LOG_SOURCES = {
-    "httpx": logging.INFO, "httpx2": logging.INFO,  # one line per HTTP request, with its status
-    "openai": logging.DEBUG, "anthropic": logging.DEBUG, "google_genai": logging.DEBUG, "ollama": logging.DEBUG,
-    "httpcore.connection": logging.DEBUG, "httpcore2.connection": logging.DEBUG,
-}
-WORTH_SHOWING = re.compile(r"HTTP Request|retr|status|error|fail|timeout|exception|connect_tcp\.(?:complete|failed)|start_tls\.(?:complete|failed)", re.IGNORECASE)
+KEYLIKE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-\.]{8,})")
+LOGGERS = ("httpx", "httpx2", "httpcore.connection", "httpcore2.connection", "openai", "anthropic", "google_genai", "ollama")
+KEY_TIMEOUT_S = 20.0
 LIST_TIMEOUT_S = 30.0
-
-# How to call each family's model list directly: (default base URL, path, auth header style)
-DIRECT = {
-    "provider-openai": ("https://api.openai.com/v1", "/models", "bearer"),
-    "provider-azure-openai": (None, "/models", "bearer"),
-    "provider-vllm": (None, "/models", "bearer"),
-    "provider-chat-completions": (None, "/models", "bearer"),
-    "provider-anthropic": ("https://api.anthropic.com", "/v1/models", "anthropic"),
-    "provider-gemini": ("https://generativelanguage.googleapis.com/v1beta", "/models", "google"),
-    "provider-ollama": ("http://localhost:11434", "/api/tags", None),
-}
 
 
 def _scrub(text: str, secrets: list[str]) -> str:
@@ -72,236 +41,189 @@ def _resolve(value: Any) -> tuple[Any, list[str], list[str]]:
     if not isinstance(value, str):
         return value, [], []
     names = VAR.findall(value)
-    missing = [n for n in names if not os.environ.get(n)]
-    return VAR.sub(lambda m: os.environ.get(m.group(1), ""), value), names, missing
+    return VAR.sub(lambda m: os.environ.get(m.group(1), ""), value), names, [n for n in names if not os.environ.get(n)]
 
 
 def _step(name: str, status: str, summary: str, **detail: Any) -> dict[str, Any]:
     return {"name": name, "status": status, "summary": summary, **detail}
 
 
-def _direct_call(url: str, style: str | None, key: str | None) -> dict[str, Any]:
-    if not url.startswith(("http://", "https://")):
-        return {"http": None, "seconds": 0, "message": f"Not an http(s) URL: {url}"}
-    headers = {"User-Agent": "amplifier-settings-diagnose"}
-    if key and style == "bearer":
-        headers["Authorization"] = f"Bearer {key}"
-    elif key and style == "anthropic":
-        headers |= {"x-api-key": key, "anthropic-version": "2023-06-01"}
-    elif key and style == "google":
-        headers["x-goog-api-key"] = key
-    started = time.monotonic()
+def _http_of(e: BaseException) -> tuple[int | None, str | None]:
+    """HTTP status and request URL from an exception or anything it wraps."""
+    status, url, seen, todo = None, None, set(), [e]
+    while todo:
+        x = todo.pop(0)
+        if x is None or id(x) in seen:
+            continue
+        seen.add(id(x))
+        code = getattr(x, "status_code", None)
+        status = status or (code if isinstance(code, int) else None)
+        req = getattr(getattr(x, "response", None), "request", None) or getattr(x, "request", None)
+        url = url or (str(getattr(req, "url", "")) or None)
+        todo += [x.__cause__, x.__context__]
+    return status, url
+
+
+def _list_models(module: str, cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """One model-list call through the provider: {http, seconds, models | message, url?, ids?}."""
+    from .provider_loader import get_provider_models
+
+    t0 = time.monotonic()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as r:  # noqa: S310 -- http(s) URL from settings
-            body = r.read(200_000)
-            count = None
-            try:
-                data = json.loads(body)
-                items = data.get("data") or data.get("models") or []
-                count = len(items) if isinstance(items, list) else None
-            except ValueError:
-                pass
-            return {"http": r.status, "seconds": round(time.monotonic() - started, 2), "models": count}
-    except urllib.error.HTTPError as e:
-        msg = ""
-        try:
-            err = json.loads(e.read(20_000) or b"{}")
-            msg = str((err.get("error") or {}).get("message") if isinstance(err.get("error"), dict) else err.get("error") or err.get("message") or "")
-        except ValueError:
-            pass
-        return {"http": e.code, "seconds": round(time.monotonic() - started, 2), "message": msg[:300]}
-    except urllib.error.URLError as e:
-        return {"http": None, "seconds": round(time.monotonic() - started, 2), "message": f"Couldn't connect: {e.reason}"}
-    except TimeoutError:
-        return {"http": None, "seconds": round(time.monotonic() - started, 2), "message": "No answer within 15 seconds."}
+        models = pool.submit(get_provider_models, module, collected_config=cfg, require_catalog=True).result(timeout=timeout)
+        ids = [str(getattr(m, "id", None) or m) for m in models]
+        return {"http": 200, "seconds": round(time.monotonic() - t0, 2), "models": len(ids), "ids": ids}
+    except concurrent.futures.TimeoutError:
+        return {"http": None, "seconds": round(time.monotonic() - t0, 2), "message": f"No answer within {timeout:.0f} seconds."}
+    except Exception as e:  # noqa: BLE001 -- this is the error we're here to show
+        status, url = _http_of(e)
+        cause = e.__cause__ or e.__context__
+        why = f" (caused by {type(cause).__name__}: {cause})" if cause and str(cause) not in str(e) else ""
+        return {"http": status, "seconds": round(time.monotonic() - t0, 2), "message": f"{type(e).__name__}: {e}{why}"[:400], "url": url, "error_type": type(e).__name__}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _key_sources(var: str, file_val: str | None, env_val: str | None, live_env: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    sources = [{"where": "keys.env", "preview": mask(file_val), "length": len(file_val)}] if file_val else []
+    set_by: list[str] = []
+    if env_val and env_val != file_val:
+        from .settings_web_env import where_set
+
+        set_by = where_set(var)
+        from_shell = live_env is not None and live_env.shell_value(var) == env_val
+        where = f"your shell ({', '.join(set_by)})" if set_by else "your shell startup files" if from_shell else "your environment (launchctl or the program that started this page)"
+        sources.append({"where": where, "preview": mask(env_val), "length": len(env_val)})
+    return sources, set_by
 
 
 def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str, Any]:
     started = time.monotonic()
-    steps: list[dict[str, Any]] = []
-    tips: list[str] = []
-    secrets: list[str] = []
-
     entry = resolve_provider_entry(settings.get_provider_overrides(), name)
     if entry is None:
         return {"provider": name, "steps": [_step("Provider", "fail", f"No provider called {name} in your settings.")], "tips": [], "seconds": 0}
     module = str(entry.get("module", ""))
-    if not module.startswith("provider-"):
-        module = f"provider-{module}"
+    module = module if module.startswith("provider-") else f"provider-{module}"
     cfg = dict(entry.get("config") or {})
+    steps: dict[str, dict[str, Any]] = {}
+    tips: list[str] = []
 
-    # 1. provider code ---------------------------------------------------------
-    pkg = "amplifier_module_" + module.replace("-", "_")
-    try:
-        version = importlib.metadata.version(pkg.replace("_", "-"))
-    except importlib.metadata.PackageNotFoundError:
-        version = None
-    found = importlib.util.find_spec(pkg) is not None
+    # 1. Provider code
     from .provider_loader import load_provider_class
 
-    cls = load_provider_class(module) if found else None
-    if cls is None:
-        steps.append(_step("Provider code", "fail", f"{module} isn't installed in this Amplifier, so it can't be used here.", module=module, version=version, source=entry.get("source")))
+    try:
+        version = importlib.metadata.version(f"amplifier-module-{module}")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    loaded = load_provider_class(module) is not None
+    msg = f"{module}{f' {version}' if version else ''} is installed and loads." if loaded else f"{module} isn't installed in this Amplifier, so it can't be used here."
+    steps["Provider code"] = _step("Provider code", "ok" if loaded else "fail", msg, module=module, version=version, source=entry.get("source"))
+    if not loaded:
         tips.append(f"Run `amplifier provider install {module.removeprefix('provider-')}`, or start a session once; Amplifier reinstalls missing providers on start.")
-    else:
-        steps.append(_step("Provider code", "ok", f"{module}{f' {version}' if version else ''} is installed and loads.", module=module, version=version, source=entry.get("source")))
 
-    # 2. settings ---------------------------------------------------------------
+    # 2. Settings
     shown, unset = {}, []
     for k, v in sorted(cfg.items()):
-        if SECRET_FIELD.search(k):
-            continue
-        resolved, names, missing = _resolve(v)
-        shown[k] = {"value": v, "resolved": resolved if names else None}
-        unset += missing
-    base_default, path, style = DIRECT.get(module, (None, None, None))
-    base_raw = cfg.get("base_url")
-    base, _, base_missing = _resolve(base_raw) if base_raw else (None, [], [])
-    base = (base or "").strip() or base_default
+        if not SECRET_FIELD.search(k):
+            resolved, names, missing = _resolve(v)
+            shown[k] = {"value": v, "resolved": resolved if names else None}
+            unset += missing
+    base = str(_resolve(cfg.get("base_url"))[0] or "").strip()
     summary = f"Calls {base}." if base else "No base URL; the provider's built-in default is used."
     if unset:
         summary += f" Not set in the environment: {', '.join(sorted(set(unset)))} (the provider falls back to its default)."
-    steps.append(_step("Settings", "ok" if base or not base_missing else "warn", summary, config=shown))
+    steps["Settings"] = _step("Settings", "ok", summary, config=shown)
 
-    # 3. API key ------------------------------------------------------------------
-    key_field = next((k for k in cfg if SECRET_FIELD.search(k)), None)
-    stored = read_keys_file()
+    # 3. API key
+    key_field = next((str(k) for k in cfg if SECRET_FIELD.search(str(k))), None)
+    raw = cfg.get(key_field) if key_field else None
+    var = (VAR.findall(raw) or [None])[0] if isinstance(raw, str) else None
     candidates: list[tuple[str, str]] = []
+    set_by: list[str] = []
     if key_field is None:
-        steps.append(_step("API key", "skip", "This provider has no API key setting."))
+        steps["API key"] = _step("API key", "skip", "This provider has no API key setting.")
+    elif not var:
+        candidates = [("in your settings file", str(raw))] if raw else []
+        steps["API key"] = _step("API key", "warn" if raw else "fail", "The key is written directly in settings. Saving on this page moves it to keys.env." if raw else "No key set.", field=key_field)
     else:
-        raw = cfg[key_field]
-        names = VAR.findall(raw) if isinstance(raw, str) else []
-        var = names[0] if names else None
-        env_val = os.environ.get(var) if var else None
-        file_val = stored.get(var) if var else None
-        if not var:
-            candidates = [("in your settings file", str(raw))] if raw else []
-            steps.append(_step("API key", "warn" if raw else "fail", "The key is written directly in settings. Saving on this page moves it to keys.env." if raw else "No key set.", field=key_field))
+        env_val, file_val = os.environ.get(var), read_keys_file().get(var)
+        sources, set_by = _key_sources(var, file_val, env_val, live_env)
+        used = env_val or file_val
+        if not used:
+            steps["API key"] = _step("API key", "fail", f"`{var}` is empty: it's not in keys.env or your environment.", variable=var, sources=sources)
+            tips.append(f"Add `{var}` on the API keys page.")
+        elif env_val and file_val and env_val != file_val:
+            steps["API key"] = _step("API key", "warn", f"`{var}` has two different values. Amplifier uses the one from your environment, because it never overrides an existing variable.", variable=var, sources=sources, used="your environment", set_by=set_by)
+            candidates = [("from your environment (the one in use)", env_val), ("from keys.env", file_val)]
         else:
-            sources = []
-            if file_val:
-                sources.append({"where": "keys.env", "preview": mask(file_val), "length": len(file_val)})
-            set_by: list[str] = []
-            if env_val and env_val != file_val:
-                from .settings_web_env import where_set
+            where = "keys.env" if file_val else "your environment"
+            steps["API key"] = _step("API key", "ok", f"`{var}` comes from {where} ({mask(used)}, {len(used)} characters).", variable=var, sources=sources, used=where)
+            candidates = [(f"from {where}", used)]
+    secrets = [v for _, v in candidates]
 
-                set_by = where_set(var)
-                from_shell = live_env is not None and live_env.shell_value(var) == env_val
-                where = f"your shell ({', '.join(set_by)})" if set_by else "your shell startup files" if from_shell else "your environment (launchctl or the program that started this page)"
-                sources.append({"where": where, "preview": mask(env_val), "length": len(env_val)})
-            used = env_val or file_val
-            if not used:
-                steps.append(_step("API key", "fail", f"`{var}` is empty: it's not in keys.env or your environment.", variable=var, sources=sources))
-                tips.append(f"Add `{var}` on the API keys page.")
-            elif env_val and file_val and env_val != file_val:
-                steps.append(_step("API key", "warn", f"`{var}` has two different values. Amplifier uses the one from your environment, because it never overrides an existing variable.", variable=var, sources=sources, used="your environment", set_by=set_by))
-                candidates = [("from your environment (the one in use)", env_val), ("from keys.env", file_val)]
-            else:
-                where = "keys.env" if file_val else "your environment"
-                steps.append(_step("API key", "ok", f"`{var}` comes from {where} ({mask(used)}, {len(used)} characters).", variable=var, sources=sources, used=where))
-                candidates = [(f"from {where}", used)]
-        secrets += [v for _, v in candidates]
-
-    # 4. direct check -------------------------------------------------------------
-    direct_results = []
-    if base and path:
-        url = base.rstrip("/") + path
-        for label, key in candidates or [("without a key", None)]:
-            res = _direct_call(url, style, key)
-            direct_results.append({"key": label, **res})
-        ok = [r for r in direct_results if r["http"] and 200 <= r["http"] < 300]
-        status = "ok" if direct_results and direct_results[0]["http"] and 200 <= direct_results[0]["http"] < 300 else "fail" if not ok else "warn"
-        first = direct_results[0]
-        if status == "ok":
-            summary = f"{url} answered {first['http']} in {first['seconds']}s" + (f" with {first['models']} models." if first.get("models") is not None else ".")
-        elif first["http"] in (401, 403):
-            summary = f"{url} rejected the key in use ({first['http']}): {first.get('message') or 'unauthorized'}"
-        elif first["http"] == 404:
-            root = _direct_call(base.split("/v1")[0].rstrip("/") + "/", None, None)
-            if root.get("http") == 404:
-                summary = f"{url} returned 404, and so does the server's root. Nothing is running behind this URL: the server, pod or tunnel is probably stopped."
-                first["nothing_running"] = True
-            else:
-                summary = f"{url} returned 404, but the server itself answers. The base URL path is probably wrong."
-        elif first["http"]:
-            summary = f"{url} answered {first['http']}: {first.get('message') or 'unexpected response'}"
+    # 4. Key check: the provider itself, once per candidate key
+    if not loaded or not candidates:
+        steps["Key check"] = _step("Key check", "skip", "Skipped: the provider code isn't available." if not loaded else "No key to check.")
+    else:
+        results = []
+        for label, value in candidates:
+            r = _list_models(module, {**cfg, str(key_field): value}, KEY_TIMEOUT_S)
+            r.pop("ids", None)
+            results.append({"key": label, **r})
+        first, works = results[0], [r for r in results if r["http"] == 200]
+        if first["http"] == 200:
+            steps["Key check"] = _step("Key check", "ok", f"The key in use works: {first['models']} models in {first['seconds']}s.", results=results)
         else:
-            summary = f"{url}: {first.get('message')}"
-        steps.append(_step("Direct API check", status, summary, url=url, results=direct_results))
-        if len(direct_results) > 1 and first["http"] in (401, 403) and any(r["http"] == 200 for r in direct_results[1:]):
-            var = steps[2].get("variable", "the key")
-            set_by = steps[2].get("set_by") or []
+            http = f" with HTTP {first['http']}" if first["http"] else ""
+            at = f" ({first['url']})" if first.get("url") else ""
+            steps["Key check"] = _step("Key check", "warn" if works else "fail", f"The key in use failed{http}{at}: {first.get('message')}", results=results)
+        if first["http"] in (401, 403) and works:
+            v = var or "the key"
             if set_by:
-                tips.insert(0, f"The saved key in keys.env works; the one set in {', '.join(set_by)} doesn't. Update or remove `export {var}=` there. This page picks the change up by itself within a few seconds.")
+                tips.insert(0, f"The saved key in keys.env works; the one set in {', '.join(set_by)} doesn't. Update or remove `export {v}=` there. This page picks the change up by itself within a few seconds.")
             else:
-                tips.insert(0, f"The saved key in keys.env works; the one in your environment doesn't. Run `launchctl unsetenv {var}` (macOS), then restart `amplifier settings` from a new terminal.")
+                tips.insert(0, f"The saved key in keys.env works; the one in your environment doesn't. Run `launchctl unsetenv {v}` (macOS), then restart `amplifier settings` from a new terminal.")
         elif first["http"] in (401, 403):
             tips.append("The provider rejected the key. Create a new key in the provider's dashboard and save it on the API keys page.")
-        elif first.get("nothing_running"):
-            tips.append("Start the server (or pod) again, or point this provider at one that's running. If its address changed, update the base URL.")
         elif first["http"] == 404:
-            tips.append("Check the base URL on the Providers page; for OpenAI-compatible servers it usually ends in `/v1`.")
-        elif first["http"] is None:
-            tips.append("Couldn't reach the server. Check your network, VPN or proxy, and the base URL.")
+            tips.append("The provider answered 404. Check the base URL on the Providers page (OpenAI-compatible servers usually end in `/v1`), and that the server is running.")
+        elif first["http"] is None and not works:
+            tips.append("Couldn't get an answer. Check your network, VPN or proxy, the base URL, and that the server is running.")
+
+    # 5. Through Amplifier, as configured, with logs captured for display
+    if not loaded:
+        steps["Through Amplifier"] = _step("Through Amplifier", "skip", "Skipped: the provider code isn't available.")
     else:
-        steps.append(_step("Direct API check", "skip", "No direct check for this provider type, or no base URL to call."))
-
-    # 5. through Amplifier, with logs ---------------------------------------------
-    if cls is not None:
         records: list[str] = []
-
         t_start = time.monotonic()
 
         class Collect(logging.Handler):
             def emit(self, record: logging.LogRecord) -> None:
-                msg = record.getMessage()
-                provider_own = record.name.startswith(pkg)
-                if provider_own or record.levelno >= logging.WARNING or WORTH_SHOWING.search(msg):
-                    records.append(f"+{time.monotonic() - t_start:5.1f}s {record.name}: {msg}")
+                records.append(f"+{time.monotonic() - t_start:5.1f}s {record.name}: {record.getMessage()}")
 
-        sources = {pkg: logging.INFO, **LOG_SOURCES}
-        loggers = [logging.getLogger(n) for n in sources]
-        saved = [(lg, lg.level, lg.propagate) for lg in loggers]
         handler = Collect(logging.DEBUG)
-        for lg, level in zip(loggers, sources.values()):
+        saved = [(lg, lg.level, lg.propagate) for lg in map(logging.getLogger, (f"amplifier_module_{module.replace('-', '_')}", *LOGGERS))]
+        for lg, _, _ in saved:
             lg.addHandler(handler)
-            lg.setLevel(level)
+            lg.setLevel(logging.INFO)
             lg.propagate = False
-        from .provider_loader import get_provider_models
-
-        t0 = time.monotonic()
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            models = pool.submit(get_provider_models, module, collected_config=cfg, require_catalog=True).result(timeout=LIST_TIMEOUT_S)
-            ids = [str(getattr(m, "id", None) or m) for m in models]
-            steps.append(_step("Through Amplifier", "ok", f"Listed {len(ids)} models in {time.monotonic() - t0:.1f}s, the same call `amplifier provider test` makes.", models=ids[:50]))
-        except concurrent.futures.TimeoutError:
-            retries = sum("retrying" in r.lower() for r in records)
-            steps.append(_step("Through Amplifier", "fail", f"No answer after {LIST_TIMEOUT_S:.0f}s{f'; the provider retried {retries} times' if retries else ''}. The log below shows what it was doing."))
-            if retries:
-                tips.append("The provider keeps retrying a failing request, so the check runs out of time. The direct check above shows the underlying error.")
-        except Exception as e:  # noqa: BLE001 -- this is the error we're here to show
-            cause = e.__cause__ or e.__context__
-            why = f" Caused by {type(cause).__name__}: {cause}" if cause and str(cause) not in str(e) else ""
-            statuses = re.findall(r'HTTP Request: (\w+ \S+) "HTTP/[\d.]+ (\d{3}[^"]*)"', "\n".join(records))
-            seen = f" Requests made: {'; '.join(f'{u} -> {s}' for u, s in statuses[-4:])}." if statuses else ""
-            steps.append(_step("Through Amplifier", "fail", f"{type(e).__name__} after {time.monotonic() - t0:.1f}s: {e}.{why}{seen}", error_type=type(e).__name__))
+            r = _list_models(module, cfg, LIST_TIMEOUT_S)
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
             for lg, level, propagate in saved:
                 lg.removeHandler(handler)
                 lg.setLevel(level)
                 lg.propagate = propagate
-        steps[-1]["log"] = [_scrub(r, secrets)[:400] for r in records[-60:]]
-        for r in records:
-            m = re.search(r"Config key '(\w+)' is a DEPRECATED alias for '(\w+)'", r)
-            if m and not any(m.group(1) in t for t in tips):
-                tips.append(f"Rename `{m.group(1)}` to `{m.group(2)}` in this provider's settings (there's a button on Home).")
-    else:
-        steps.append(_step("Through Amplifier", "skip", "Skipped: the provider code isn't available."))
+        log = [_scrub(x, secrets)[:400] for x in records[-60:]]
+        if r["http"] == 200:
+            steps["Through Amplifier"] = _step("Through Amplifier", "ok", f"Listed {r['models']} models in {r['seconds']}s, the same call `amplifier provider test` makes.", models=r["ids"][:50], log=log)
+        else:
+            at = f" from {r['url']}" if r.get("url") else ""
+            http = f"HTTP {r['http']}{at} after" if r["http"] else "after"
+            steps["Through Amplifier"] = _step("Through Amplifier", "fail", f"{http} {r['seconds']}s. {r['message']}", error_type=r.get("error_type"), log=log)
 
-    if not tips and all(s["status"] in ("ok", "skip") for s in steps):
+    if not tips and all(s["status"] in ("ok", "skip") for s in steps.values()):
         tips.append("Everything checks out. If sessions still fail, the problem is with a specific model or request; run a session with `--verbose`.")
-    report = {"provider": name, "module": module, "steps": steps, "tips": tips, "seconds": round(time.monotonic() - started, 1)}
+    report = {"provider": name, "module": module, "steps": list(steps.values()), "tips": tips, "seconds": round(time.monotonic() - started, 1)}
     return json.loads(_scrub(json.dumps(report, default=str), secrets))

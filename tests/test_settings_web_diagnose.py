@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from amplifier_app_cli import settings_web_system as system
 from amplifier_app_cli.lib.settings import AppSettings, SettingsPaths
-from amplifier_app_cli.settings_web import build_state
-from amplifier_app_cli.settings_web_routing import RoutingService
 
 
 @pytest.fixture(autouse=True)
@@ -51,5 +46,73 @@ def test_diagnose_explains_each_step_and_never_leaks_keys(home: Path, tmp_path: 
     assert steps["API key"]["status"] == "warn" and "two different values" in steps["API key"]["summary"]
     wheres = [s["where"] for s in steps["API key"]["sources"]]
     assert wheres[0] == "keys.env" and wheres[1].startswith("your ")  # names the shell file when it can
+    assert steps["Key check"]["status"] == "skip" and steps["Through Amplifier"]["status"] == "skip"
     assert "saved-value" not in str(report) and "shell-value" not in str(report)
     assert diagnose(settings, "missing")["steps"][0]["status"] == "fail"
+
+
+def _demo_settings(home: Path, tmp_path: Path) -> AppSettings:
+    (home / "settings.yaml").write_text(
+        yaml.safe_dump({"config": {"providers": [{"id": "demo", "module": "provider-nothing-here", "config": {"api_key": "${DEMO_KEY}"}}]}})
+    )
+    proj = tmp_path / "p4" / ".amplifier"
+    proj.mkdir(parents=True)
+    return AppSettings(SettingsPaths(home / "settings.yaml", proj / "settings.yaml", proj / "settings.local.yaml"))
+
+
+def test_diagnose_key_check_reads_status_from_exception_chain(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from amplifier_app_cli import provider_loader, settings_web_env
+    from amplifier_app_cli.settings_web_diagnose import diagnose
+
+    saved, shell = "saved-value-abcdef123456", "shell-value-zyxwvu987654"
+    (home / "keys.env").write_text(f'DEMO_KEY="{saved}"\n')
+    monkeypatch.setenv("DEMO_KEY", shell)
+    monkeypatch.setattr(settings_web_env, "where_set", lambda var: ["~/.zshrc:12"])
+    monkeypatch.setattr(provider_loader, "load_provider_class", lambda module: object)
+    calls: list[str] = []
+
+    class HTTPStatusError(Exception):
+        status_code = 401
+        response = SimpleNamespace(request=SimpleNamespace(url="https://api.example.test/v1/models"))
+
+    class AuthenticationError(Exception):
+        pass
+
+    def fake_models(module: str, collected_config: dict, require_catalog: bool = False) -> list:
+        key = collected_config["api_key"]
+        calls.append(key)
+        if key == saved:
+            return [SimpleNamespace(id="model-a"), SimpleNamespace(id="model-b")]
+        raise AuthenticationError(f"Incorrect API key provided: {shell}") from HTTPStatusError("401 Unauthorized")
+
+    monkeypatch.setattr(provider_loader, "get_provider_models", fake_models)
+    report = diagnose(_demo_settings(home, tmp_path), "demo")
+    steps = {s["name"]: s for s in report["steps"]}
+    assert calls == [shell, saved, "${DEMO_KEY}"]  # each candidate, then as configured
+    check = steps["Key check"]
+    assert check["status"] == "warn"
+    assert [r["http"] for r in check["results"]] == [401, 200]
+    assert check["results"][1]["models"] == 2
+    assert "https://api.example.test/v1/models" in check["summary"]
+    assert steps["Through Amplifier"]["status"] == "fail" and "HTTP 401" in steps["Through Amplifier"]["summary"]
+    assert "~/.zshrc:12" in report["tips"][0] and "keys.env works" in report["tips"][0]
+    assert saved not in str(report) and shell not in str(report)
+
+
+def test_diagnose_all_ok_when_key_works(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from amplifier_app_cli import provider_loader
+    from amplifier_app_cli.settings_web_diagnose import diagnose
+
+    (home / "keys.env").write_text('DEMO_KEY="saved-value-abcdef123456"\n')
+    monkeypatch.delenv("DEMO_KEY", raising=False)
+    monkeypatch.setattr(provider_loader, "load_provider_class", lambda module: object)
+    monkeypatch.setattr(provider_loader, "get_provider_models", lambda module, collected_config, require_catalog=False: [SimpleNamespace(id="m")])
+    report = diagnose(_demo_settings(home, tmp_path), "demo")
+    assert [s["status"] for s in report["steps"]] == ["ok", "ok", "ok", "ok", "ok"]
+    assert [s["name"] for s in report["steps"]] == ["Provider code", "Settings", "API key", "Key check", "Through Amplifier"]
+    assert "Everything checks out" in report["tips"][0]
+    assert "saved-value" not in str(report)
