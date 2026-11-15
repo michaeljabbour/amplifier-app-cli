@@ -4,13 +4,14 @@ Discovery, which file wins for each matrix name, which providers count as
 configured, whether a pattern matches a live model, and which candidate wins
 are all delegated to `commands/routing.py`, so the page and `amplifier routing
 list/show` cannot disagree. This module adds: the user's unsaved
-`routing.overrides` composed in for preview, and model listing that keeps the
-failure reason.
+`routing.overrides` composed in for preview, model listing that keeps the
+failure reason, and saving a whole matrix the way `amplifier routing create` does.
 """
 
 from __future__ import annotations
 
 import copy
+import datetime
 import logging
 import os
 import threading
@@ -23,7 +24,11 @@ from .commands import routing as cli
 from .lib.routing_provenance import resolve_matrix_origins
 from .lib.settings import AppSettings, get_custom_routing_dir
 from .settings_web_system import SettingsError, run_with_timeout
+from .utils.atomic_write import atomic_write_yaml
 
+# hooks-routing's validate_matrix_name (matrix_loader.py) accepts [a-z][a-z0-9_-]*; the hook isn't
+# importable outside a session, so the pattern is repeated here, capped at 64 characters.
+REQUIRED_ROLES = ("general", "fast")
 EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
@@ -224,3 +229,40 @@ class RoutingService:
         except Exception as e:  # noqa: BLE001 -- auth / network errors: show the provider's own words
             error = f"{type(e).__name__}: {e}"[:300]
         return {"provider": provider, "models": models, "error": error, "warnings": warnings, "seconds": round(time.monotonic() - started, 1)}
+
+    # -- `amplifier routing create` -------------------------------------------
+    def save_matrix(self, body: dict[str, Any]) -> dict[str, Any]:
+        name = str(body.get("name") or "").strip()
+        if not cli.MATRIX_NAME_RE.fullmatch(name):
+            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Use lowercase letters, numbers, hyphens and underscores for the name (up to 64), starting with a letter.")
+        roles = body.get("roles") if isinstance(body.get("roles"), dict) else {}
+        missing = [r for r in REQUIRED_ROLES if r not in roles]
+        if missing:
+            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, f"Every matrix needs these roles: {', '.join(missing)}.")
+        clean: dict[str, Any] = {}
+        for role, data in roles.items():
+            cands = [c for c in (data or {}).get("candidates", []) if isinstance(c, dict)]
+            if not cands:
+                raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, f"The {role} role has no models to try.")
+            clean[str(role)] = {
+                "description": str((data or {}).get("description") or ""),
+                "candidates": [{k: c[k] for k in ("provider", "model", "config") if c.get(k)} for c in cands],
+            }
+        target = get_custom_routing_dir() / f"{name}.yaml"
+        if target.exists() and not body.get("overwrite"):
+            raise SettingsError(HTTPStatus.CONFLICT, f"You already have a matrix called {name}.", exists=True)
+        atomic_write_yaml(
+            target,
+            {"name": name, "description": str(body.get("description") or f"Custom matrix: {name}"), "updated": datetime.date.today().isoformat(), "roles": clean},
+            sort_keys=False,
+        )
+        return {"name": name, "path": str(target)}
+
+    def delete_matrix(self, name: str) -> dict[str, Any]:
+        custom = get_custom_routing_dir()
+        target = custom / f"{name}.yaml"
+        # any file of yours, including one named before the hook's rule; never a path outside the folder
+        if target.parent != custom or not target.is_file():
+            raise SettingsError(HTTPStatus.NOT_FOUND, "Only matrices you created can be deleted.")
+        target.unlink()
+        return {"ok": True}

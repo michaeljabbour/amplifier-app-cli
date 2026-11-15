@@ -9,10 +9,12 @@ import routing from "./pages/routing.js";
 import bundles from "./pages/bundles.js";
 import notifications from "./pages/notifications.js";
 import keys from "./pages/keys.js";
+import update from "./pages/update.js";
+import reset from "./pages/reset.js";
 import file from "./pages/file.js";
 
-const PAGES = Object.fromEntries([home, providers, routing, bundles, notifications, keys, file].map((p) => [p.id, p]));
-const GROUPS = ["", "Models", "Sessions", "Access", "Advanced"];
+const PAGES = Object.fromEntries([home, providers, routing, bundles, notifications, keys, update, reset, file].map((p) => [p.id, p]));
+const GROUPS = ["", "Models", "Sessions", "Access", "Maintenance", "Advanced"];
 const page = () => PAGES[S.tab];
 
 // ---------------------------------------------------------------- rendering
@@ -51,7 +53,8 @@ function renderMain() {
   if (!S.state) return;
   const s = cur();
   const p = page();
-  const banner = LIVE.stale ? staleBanner() : null;
+  const banner = HALTED === "restart" ? restartBanner()
+    : LIVE.stale ? staleBanner() : null;
   const kids = p.scoped && s.error && !p.readsBrokenFile
     ? [h("div", { class: "notice stop" }, h("p", {}, h("strong", { text: "This settings file can't be read, so editing is turned off. " }), s.error), link("Fix the file", "#file", { icon: "file" }))]
     : p.scoped && p.id !== "file" && rawDirty()
@@ -59,6 +62,7 @@ function renderMain() {
     : p.view(s);
   $("main").replaceChildren(...[banner, ...kids].flat().filter(Boolean));
 }
+const restartBanner = () => h("div", { class: "notice stop" }, h("strong", { md: "Amplifier was updated or reset. Run `amplifier settings` again." }));
 const staleBanner = () => h("div", { class: "notice wait", id: "stale" }, h("span", { text: "Settings changed outside this page while you were editing." }),
   h("div", { class: "actions" },
     btn("Load the new settings", () => { LIVE.stale = false; reload({ message: "Loaded the new settings. Your unsaved edits were discarded." }); }, { icon: "refresh", small: true }),
@@ -117,12 +121,14 @@ async function checkForChanges() {
 on("adopt", (fromServer) => { if (fromServer) Object.assign(LIVE, { stale: false, fingerprint: null }); });
 
 // ---------------------------------------------------------------- stopping
-// "expired": the session isn't valid (401), so nothing else can work.
+// "expired": the session isn't valid (401), so nothing else can work. "restart": an
+// update or reset replaced Amplifier (503); job output still polls /api/jobs.
 let HALTED = null;
 onHalt((why) => {
-  if (HALTED) return;
+  if (HALTED === "expired") return;
   HALTED = why;
   clearInterval(LIVE.timer);
+  if (why === "restart") return S.state ? renderMain() : $("main").replaceChildren(restartBanner());
   S.state = null; // nothing left to save
   document.body.replaceChildren(h("main", { class: "halted" },
     h("section", { class: "panel pad" }, h("h1", { text: "This settings page has expired." }), h("p", { md: "Run `amplifier settings` again to open a new one." }))));

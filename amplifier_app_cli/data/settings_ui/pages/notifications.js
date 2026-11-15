@@ -1,4 +1,5 @@
 // Notifications: the settings `amplifier notify desktop|ntfy` writes. The ntfy topic lives in keys.env.
+import { api } from "../lib/api.js";
 import { h, btn, field, switchRow, panel, toast } from "../lib/dom.js";
 import { S, getIn, setIn, delIn, prune, changed, truthy, keyInfo, paint, scopeNote } from "../lib/store.js";
 import { secretWidget, saveKey, reveal } from "../lib/secret.js";
@@ -23,6 +24,12 @@ export function notifyControls(doc, apply) {
     toast("Created your private channel. Now subscribe to it in the ntfy app.");
     setPush(true);
   };
+  const sendTest = async () => {
+    try {
+      await api("/api/notify/test", {});
+      toast("Sent. It should arrive on your phone within a few seconds.");
+    } catch (e) { toast(e.message); }
+  };
   return [
     switchRow("Desktop notifications", "A notification on this computer when the assistant finishes and is waiting for you.", desktopOn, (enabled) => apply((d) => setIn(d, [...NOTIFY, "desktop", "enabled"], enabled))),
     switchRow("Phone notifications", "A push notification on your phone, through the free ntfy app.", pushOn, (enabled) => (enabled && !hasTopic ? createChannel() : setPush(enabled))),
@@ -30,9 +37,11 @@ export function notifyControls(doc, apply) {
       ? h("div", { class: "phone-setup" },
           h("ol", { class: "howto" },
             h("li", {}, "Install the free ntfy app for ", h("a", { href: "https://apps.apple.com/app/ntfy/id1625396347", target: "_blank", rel: "noreferrer", text: "iPhone" }), " or ", h("a", { href: "https://play.google.com/store/apps/details?id=io.heckel.ntfy", target: "_blank", rel: "noreferrer", text: "Android" }), "."),
-            h("li", { text: "In the app, tap + and subscribe to your private channel name below. Use the eye to see it, then copy it." })),
+            h("li", { text: "In the app, tap + and subscribe to your private channel name below. Use the eye to see it, then copy it." }),
+            h("li", { text: "Send a test to check it arrives." })),
           hasTopic ? field("Your private channel", secretWidget(NTFY_TOPIC, "No channel yet")) : btn("Create a private channel", createChannel, { icon: "plus", kind: "primary" }),
-          h("p", { class: "hint", text: "Treat the channel name like a password: anyone who knows it can read your notifications. It's kept in keys.env, never in your settings." }))
+          h("p", { class: "hint", text: "Treat the channel name like a password: anyone who knows it can read your notifications. It's kept in keys.env, never in your settings." }),
+          hasTopic ? h("div", { class: "actions" }, btn("Send a test notification", sendTest, { icon: "bell" })) : null)
       : null,
   ];
 }

@@ -10,6 +10,7 @@ const ICONS = {
   bell: ["M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9", "M10.3 21a1.94 1.94 0 0 0 3.4 0"],
   key: [[7.5, 15.5, 4.5], "M10.7 12.3 21 2", "M16 7l3 3", "M19 4l2 2"],
   refresh: ["M21 12a9 9 0 1 1-2.6-6.4L21 8", "M21 3v5h-5"],
+  undo: ["M3 12a9 9 0 1 0 2.6-6.4L3 8", "M3 3v5h5"],
   file: ["M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z", "M14 3v6h6"],
   up: ["M12 19V5", "M5 12l7-7 7 7"],
   down: ["M12 5v14", "M19 12l-7 7-7-7"],
@@ -22,9 +23,11 @@ const ICONS = {
   check: ["M20 6 9 17l-5-5"],
   pin: ["M12 17v5", "M9 3h6l-1 6 3 3v2H7v-2l3-3z"],
   plug: ["M9 2v6M15 2v6", "M6 8h12v4a6 6 0 0 1-12 0z", "M12 18v4"],
+  play: ["M7 4l13 8-13 8z"],
   chevron: ["M9 6l6 6-6 6"],
   save: ["M5 3h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M7 3v5h8", "M7 21v-7h10v7"],
   copy: ["M9 9h11v11H9z", "M5 15H4V4h11v1"],
+  pulse: ["M22 12h-4l-3 9L9 3l-3 9H2"],
 };
 
 // h(tag, props, ...kids). `text` is plain text; `md` is UI copy; `vars` sets CSS custom properties.
@@ -126,3 +129,15 @@ export function toast(msg) {
   setTimeout(() => t.remove(), 4000);
 }
 
+export function fmtBytes(n) {
+  if (n === null || n === undefined) return "large";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${i && n < 10 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+export function fmtAgo(hrs) {
+  if (hrs === null || hrs === undefined) return null;
+  if (hrs < 1) return `${plural(Math.max(1, Math.round(hrs * 60)), "minute")} ago`;
+  return hrs < 48 ? `${plural(Math.round(hrs), "hour")} ago` : `${plural(Math.round(hrs / 24), "day")} ago`;
+}

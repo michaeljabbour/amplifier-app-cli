@@ -82,7 +82,7 @@ function board(inUseName, inUseFrom) {
     head, legend,
     notes.length ? h("div", { class: "pad notes" }, notes) : null,
     h("div", { role: "list" }, res.roles.map((role, i) => roleLine(role, i, res, owner[role.name]))),
-    boardFoot(res));
+    boardFoot(res, m));
   if (!R.busy) R.arrive = false;
   return el;
 }
@@ -189,18 +189,43 @@ function pinEditor(role, res) {
     h("div", { class: "actions" }, btn("Pin model", commit, { icon: "pin", kind: "primary" }), btn("Cancel", () => { close(); paint(); }, { kind: "ghost" })));
 }
 
-function boardFoot(res) {
+function boardFoot(res, m) {
   const have = new Set(res.roles.map((r) => r.name));
   const roleIn = h("input", { type: "text", list: "known-roles", placeholder: "e.g. security-audit", "aria-label": "Role to add" });
+  const nameIn = h("input", { type: "text", placeholder: `${R.preview}-mine`, "aria-label": "Name for the new matrix" });
   const addRole = () => {
     const name = roleIn.value.trim();
     if (!name) return;
     if (!have.has(name)) res.roles.push({ name, description: res.known_roles[name] || "", candidates: [], winner: null, problem: "no-provider", overridden: false });
     openPin(name);
   };
+  const saveAs = async (overwrite = false) => {
+    const roles = Object.fromEntries(res.roles.filter((r) => r.candidates.length).map((r) => [r.name, { description: r.description, candidates: r.candidates.map(({ provider, model, config }) => ({ provider, model, config })) }]));
+    const n = nameIn.value.trim() || `${R.preview}-mine`;
+    try {
+      await api("/api/routing/matrix", { name: n, description: `Based on ${R.preview}${res.roles.some((r) => r.overridden) ? ", with your pins" : ""}.`, roles, overwrite });
+      toast(`Saved ${n} to your matrices.`);
+      Object.assign(R, { preview: n, arrive: true });
+      await refreshRouting({ matrices: true });
+    } catch (e) {
+      if (e.data?.exists && confirm(`${e.message} Replace it?`)) return saveAs(true);
+      toast(e.message);
+    }
+  };
+  const remove = async () => {
+    if (!confirm(`Delete your matrix ${R.preview}? This removes ${m.path}.`)) return;
+    try {
+      await api("/api/routing/matrix/delete", { name: R.preview });
+      toast(`Deleted ${R.preview}.`);
+      R.preview = null;
+      refreshRouting({ matrices: true });
+    } catch (e) { toast(e.message); }
+  };
   return h("div", { class: "board-foot" },
     h("div", { class: "foot-item" }, field("Add a role this matrix doesn't have", roleIn, "Agents that ask for it get the model you pin."), btn("Add role", addRole, { icon: "plus" })),
-    h("datalist", { id: "known-roles" }, Object.entries(res.known_roles).filter(([r]) => !have.has(r)).map(([r, d]) => h("option", { value: r, label: d }))));
+    h("datalist", { id: "known-roles" }, Object.entries(res.known_roles).filter(([r]) => !have.has(r)).map(([r, d]) => h("option", { value: r, label: d }))),
+    h("div", { class: "foot-item" }, field("Save this view as your own matrix", nameIn, "Includes your pins. Same result as `amplifier routing create`."), btn("Save as matrix", () => saveAs(false), { icon: "save" })),
+    m?.origin === "yours" ? btn("Delete this matrix", remove, { icon: "trash", kind: "danger" }) : null);
 }
 
 export default {

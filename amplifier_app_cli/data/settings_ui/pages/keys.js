@@ -1,9 +1,37 @@
 // API keys: everything in keys.env plus every ${VAR} the settings use. The server
 // marks which are secrets (`secret: true`); the rest are optional values.
-import { h, btn, lede, panel, toast } from "../lib/dom.js";
-import { S, getIn, providerName, PLACEHOLDER } from "../lib/store.js";
+import { api } from "../lib/api.js";
+import { h, btn, lede, panel, toast, plural } from "../lib/dom.js";
+import { S, getIn, providerName, PLACEHOLDER, paint } from "../lib/store.js";
 import { secretWidget, editKey } from "../lib/secret.js";
 import { isNtfyTopic } from "./notifications.js";
+
+// the login shell, read only on request: which names a new terminal would set differently
+let shell = null; // {differences, error} from the last re-read
+let reading = false;
+async function reread() {
+  reading = true;
+  paint("keys");
+  try { shell = await api("/api/env/reread", {}); } catch (e) { shell = { differences: [], error: e.message }; }
+  reading = false;
+  paint("keys");
+}
+const said = (v) => (v === "set" ? "set" : "not set");
+
+function shellPanel() {
+  const seen = shell || (S.state.env?.reread_at ? { differences: S.state.env.differences || [] } : null);
+  const diffs = seen?.differences || [];
+  return panel("Your shell", "This page uses the environment of the terminal that started it. A new terminal may see something else, for example after you edit `~/.zshrc`.",
+    h("div", { class: "pad" },
+      h("div", { class: "actions" },
+        btn(reading ? "Reading your shell…" : "Re-read my shell", reread, { icon: "refresh", disabled: reading }),
+        seen && !seen.error ? h("span", { class: "hint", text: diffs.length ? `${plural(diffs.length, "difference")} from this page` : "A new terminal sets the same keys as this page." }) : null),
+      seen?.error ? h("p", { class: "notice wait", text: seen.error }) : null,
+      diffs.length ? h("table", { class: "mini" },
+        h("thead", {}, h("tr", {}, ["Name", "This page", "A new terminal", "Where it's set"].map((t) => h("th", { text: t })))),
+        h("tbody", {}, diffs.map((d) => h("tr", {}, h("td", {}, h("code", { text: d.name })), h("td", { text: said(d.launch) }), h("td", { text: said(d.shell) }), h("td", { text: (d.where || []).join(", ") || "—" }))))) : null,
+      diffs.length ? h("p", { class: "hint", md: "Amplifier uses what this page uses until you run `amplifier settings` again from a new terminal." }) : null));
+}
 
 export default {
   id: "keys", title: "API keys", crumb: "Secrets your providers use, kept out of your settings files.", group: "Access", icon: "key",
@@ -32,6 +60,7 @@ export default {
       lede(`Saved in \`${home}/keys.env\`, which only you can read. Values are masked; use the eye to reveal one at a time.`,
         "Values exported in the terminal that started this page win over keys.env, exactly as when you run Amplifier. Keys you save here work right away."),
       h("section", { class: "panel" }, keys.filter((k) => k.secret).map(card), h("div", { class: "adder" }, nk, btn("Add a key", addKey, { icon: "plus" }))),
+      shellPanel(),
       values.length ? panel("Other values your settings read", "Optional, like custom endpoints or context sizes. When one isn't set, the provider uses its default.", values.map(card)) : null,
     ];
   },

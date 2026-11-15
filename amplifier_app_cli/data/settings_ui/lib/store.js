@@ -132,6 +132,15 @@ export async function reload({ message } = {}) {
     if (message) toast(message);
   } catch (e) { toast(e.message); }
 }
+// fresh status and keys without touching unsaved edits
+export async function refreshStatus() {
+  try {
+    const next = await api("/api/state");
+    Object.assign(S.state, { status: next.status, keys: next.keys });
+  } catch { /* keep the last status */ }
+  paintNav();
+  paint("home", "update");
+}
 // adopt the {keys, status} a key write returns
 export function adoptKeys(res) {
   Object.assign(S.state, { keys: res.keys, status: res.status });

@@ -18,7 +18,7 @@ const ready = token
       .catch(() => {})
   : Promise.resolve();
 
-// app.js shows the expired page (401 relaunch)
+// app.js shows the expired page (401 relaunch) or the restart banner (503 restart)
 let onHaltFn = () => {};
 export const onHalt = (fn) => { onHaltFn = fn; };
 
@@ -32,7 +32,7 @@ export async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({ error: `The settings page answered ${res.status}.` }));
-  const halt = res.status === 401 && data.relaunch ? "expired" : null;
+  const halt = res.status === 401 && data.relaunch ? "expired" : res.status === 503 && data.restart ? "restart" : null;
   if (halt) onHaltFn(halt);
   if (!res.ok) throw Object.assign(new Error(data.error || "Request failed."), { status: res.status, data, halt });
   return data;

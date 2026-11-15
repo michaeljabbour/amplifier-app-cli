@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from amplifier_app_cli.lib.settings import AppSettings, SettingsPaths
+from amplifier_app_cli.commands.routing import MATRIX_NAME_RE
 from amplifier_app_cli.settings_web_routing import RoutingService, compose
 from amplifier_app_cli.settings_web_system import SettingsError, run_with_timeout
 
@@ -30,9 +31,10 @@ MATRIX = {
 
 
 @pytest.fixture(autouse=True)
-def _no_fetch(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def _no_shell_no_fetch(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     from amplifier_app_cli.commands import routing
 
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_SHELL_ENV", "off")  # no test starts $SHELL
     fetched: list[str] = []
     monkeypatch.setattr(routing, "_ensure_routing_bundle_cached", lambda: fetched.append("fetch"))
     return fetched
@@ -108,11 +110,46 @@ def test_unknown_matrix_is_404(svc: RoutingService) -> None:
     assert exc.value.status == 404
 
 
-def test_empty_cache_never_fetches(svc: RoutingService, _no_fetch: list[str]) -> None:
+def test_save_matrix_rules(svc: RoutingService) -> None:
+    roles = {r: {"description": d["description"], "candidates": d["candidates"]} for r, d in MATRIX["roles"].items()}
+    out = svc.save_matrix({"name": "mine", "roles": roles})
+    saved = yaml.safe_load(Path(out["path"]).read_text())
+    assert saved["name"] == "mine" and set(saved["roles"]) == {"general", "fast"}
+    assert "mine" in {m["name"] for m in svc.matrices()}
+    with pytest.raises(SettingsError) as exc:
+        svc.save_matrix({"name": "mine", "roles": roles})
+    assert exc.value.status == 409 and exc.value.extra == {"exists": True}
+    svc.save_matrix({"name": "mine", "roles": roles, "overwrite": True})
+    with pytest.raises(SettingsError, match="general"):
+        svc.save_matrix({"name": "nofast", "roles": {"fast": roles["fast"]}})
+    with pytest.raises(SettingsError):
+        svc.save_matrix({"name": "../escape", "roles": roles})
+    svc.delete_matrix("mine")
+    assert "mine" not in {m["name"] for m in svc.matrices()}
+    with pytest.raises(SettingsError):
+        svc.delete_matrix("../settings")
+    (Path(out["path"]).parent / "Legacy.yaml").write_text("roles: {}\n")  # named before the hook's rule
+    svc.delete_matrix("Legacy")
+
+
+@pytest.mark.parametrize("name", ["Fast", "2x", "-x", "_x", "a b", "a.b", "x" * 65])
+def test_matrix_names_the_hook_rejects_are_refused(svc: RoutingService, name: str) -> None:
+    assert not MATRIX_NAME_RE.fullmatch(name)
+    with pytest.raises(SettingsError) as exc:
+        svc.save_matrix({"name": name, "roles": {}})
+    assert exc.value.status == 422
+
+
+@pytest.mark.parametrize("name", ["fast", "team-2", "my_matrix", "a"])
+def test_matrix_names_the_hook_accepts(name: str) -> None:
+    assert MATRIX_NAME_RE.fullmatch(name)
+
+
+def test_empty_cache_never_fetches(svc: RoutingService, _no_shell_no_fetch: list[str]) -> None:
     """No routing-matrix bundle cached: the page lists what exists and never downloads."""
     assert [m["name"] for m in svc.matrices()] == ["team"]
     svc.resolve("team", {}, live=False)
-    assert _no_fetch == []
+    assert _no_shell_no_fetch == []
 
 
 def test_slow_provider_call_is_abandoned_on_a_daemon_thread() -> None:

@@ -22,6 +22,7 @@ Safety model:
   * secret-named values in settings documents are replaced by MASKED and put
     back from disk on save; the raw file is sent only when the File page asks
     (/api/scope/raw); key values are masked, one is revealed only when asked
+  * after an update or reset has run, the page must be relaunched (503)
 """
 
 from __future__ import annotations
@@ -45,9 +46,11 @@ import yaml
 from amplifier_foundation.paths.resolution import get_amplifier_home
 
 from . import settings_web_system as system
+from .lib.env_vars import ENV_PATTERN
 from .lib.settings import AppSettings, Scope
 from .paths import is_running_from_home
 from .provider_sources import DEFAULT_PROVIDER_SOURCES
+from .settings_web_diagnose import diagnose
 from .settings_web_env import LiveEnv
 from .settings_web_routing import RoutingService
 from .settings_web_system import SettingsError
@@ -61,6 +64,7 @@ EDITABLE_SCOPES: tuple[Scope, ...] = ("global", "project", "local")
 MASKED = "•••• hidden"
 HOME_SCOPE_REASON = "You're in your home folder, where project and local settings would be your global file. Run `amplifier settings` from a project folder to edit them."
 EXPIRED = "This settings page has expired. Run `amplifier settings` again to open a new one."
+RESTART = "Amplifier was updated or reset. Run amplifier settings again."
 MAX_BODY = 1_000_000
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
@@ -253,7 +257,7 @@ def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def sync_env(server: Any) -> None:
     """Bring os.environ up to date with keys.env (never runs a shell)."""
-    names = set().union(*(placeholders(d) for d in scope_docs(server.settings)))
+    names = set().union(*(placeholders(d) for d in scope_docs(server.settings))) | {system.NTFY_TOPIC}
     if server.env.refresh(names):
         server.routing.refresh()  # values changed: model lists must be fetched again
 
@@ -287,12 +291,14 @@ def build_state(server: Any) -> dict[str, Any]:
         status = system.status(settings, server.routing, keys, settings.get_merged_settings())
     except Exception as e:  # noqa: BLE001 -- home must render even when status can't
         status = {"error": f"Couldn't work out Amplifier's status: {e}"}
+    status["jobs"] = server.jobs.info()
     return {
         "home": str(get_amplifier_home()),
         "scopes": scopes,
         "keys": keys,
         "status": status,
         "defaults": defaults,
+        "env": server.env.info(),
         "known_providers": [{"module": m, "source": s} for m, s in sorted(DEFAULT_PROVIDER_SOURCES.items())],
     }
 
@@ -389,9 +395,20 @@ def changes(server: Any, q: dict[str, str]) -> dict[str, Any]:
     return {"fingerprint": hashlib.sha256("|".join(parts).encode()).hexdigest()}
 
 
+def env_reread(server: Any, body: dict[str, Any]) -> dict[str, Any]:
+    """Compare a new login shell with the launch environment. Explains; never changes os.environ."""
+    names = placeholders(scope_docs(server.settings)) | set(system.read_keys_file()) | {system.NTFY_TOPIC}
+    return server.env.reread(names)
+
+
 def routing_models(server: Any, q: dict[str, str]) -> dict[str, Any]:
     sync_env(server)
     return server.routing.models(q.get("provider", ""))
+
+
+def diagnose_provider(server: Any, body: dict[str, Any]) -> dict[str, Any]:
+    sync_env(server)
+    return diagnose(server.settings, str(body.get("name") or ""), server.env)
 
 
 def reveal_key(server: Any, body: dict[str, Any]) -> dict[str, Any]:
@@ -408,13 +425,21 @@ ROUTES: dict[tuple[str, str], Handler] = {
     ("GET", "/api/state"): lambda s, q: build_state(s),
     ("GET", "/api/changes"): changes,
     ("GET", "/api/scope/raw"): scope_raw,
+    ("GET", "/api/reset/categories"): lambda s, q: system.reset_info(),
     ("GET", "/api/provider-schema"): lambda s, q: system.provider_schema(q.get("module", "")),
+    ("GET", "/api/jobs"): lambda s, q: s.jobs.get(q.get("id", "")),
     ("GET", "/api/routing/matrices"): lambda s, q: {"matrices": s.routing.matrices()},
     ("GET", "/api/routing/models"): routing_models,
     ("POST", "/api/scope"): save_scope,
     ("POST", "/api/key"): save_key,
     ("POST", "/api/key/reveal"): reveal_key,
+    ("POST", "/api/env/reread"): env_reread,
+    ("POST", "/api/jobs"): lambda s, b: s.jobs.start(str(b.get("kind")), b.get("options") if isinstance(b.get("options"), dict) else {}),
+    ("POST", "/api/notify/test"): lambda s, b: system.notify_test(s.settings.get_merged_settings()),
+    ("POST", "/api/providers/diagnose"): diagnose_provider,
     ("POST", "/api/routing/resolve"): lambda s, b: s.routing.resolve(str(b.get("matrix") or ""), b.get("overrides") or {}, bool(b.get("live"))),
+    ("POST", "/api/routing/matrix"): lambda s, b: s.routing.save_matrix(b),
+    ("POST", "/api/routing/matrix/delete"): lambda s, b: s.routing.delete_matrix(str(b.get("name") or "")),
 }
 
 
@@ -496,6 +521,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 return self._json(HTTPStatus.OK, {"secret": self.server.exchange(self._body().get("token"))})
             if not self._authed():
                 return self._json(HTTPStatus.UNAUTHORIZED, {"error": EXPIRED, "relaunch": True})
+            if self.server.jobs.restart_required and (method, url.path) != ("GET", "/api/jobs"):
+                return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": RESTART, "restart": True})
             route = ROUTES.get((method, url.path))
             if route is None:
                 return self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
@@ -518,6 +545,7 @@ class SettingsServer(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), _RequestHandler)
         self.settings = settings or AppSettings()
         self.routing = RoutingService(self.settings)
+        self.jobs = system.Jobs(cwd=os.getcwd())
         self.env = LiveEnv()
         self.verbose = verbose
         self.launch_token: str | None = secrets.token_urlsafe(24)

@@ -1,4 +1,4 @@
-"""LiveEnv: the launch environment is the truth, and keys.env follows live."""
+"""LiveEnv: the launch environment is the truth, keys.env follows live, the shell only explains."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
     from amplifier_app_cli.commands import routing
 
     monkeypatch.setattr(routing, "_ensure_routing_bundle_cached", lambda: None)
+    # never spawn the developer's login shell or a real update/reset from a test
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_SHELL_ENV", "off")
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_JOBS", "off")
 
 
 @pytest.fixture
@@ -47,22 +50,58 @@ def test_launch_env_wins_then_keys_env_live(home: Path, monkeypatch: pytest.Monk
     (home / "keys.env").write_text("")
     assert env.refresh(set())
     assert "MY_KEY" not in os.environ  # left keys.env, never in the launch env: gone
+    assert env.shell_value("LIVE_KEY") is None  # no re-read happened
+
+
+def test_reread_explains_differences_without_touching_the_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import settings_web_env as live
+
+    monkeypatch.delenv("AMPLIFIER_SETTINGS_SHELL_ENV")
+    monkeypatch.setenv("LIVE_KEY", "direnv-only-1234567890")  # e.g. from direnv or `op run`
+    (home / "keys.env").write_text('MY_KEY="same-everywhere-12345"\n')
+    shell = {"HOME": str(home), "MY_KEY": "same-everywhere-12345", "EMPTY_KEY": "x"}
+    monkeypatch.setattr(live, "login_shell_env", lambda: dict(shell))
+    monkeypatch.setattr(live, "where_set", lambda name: [f"~/.zshrc line {len(name)}"])
+    env = live.LiveEnv()
+    env.refresh({"LIVE_KEY", "MY_KEY", "EMPTY_KEY"})
+    out = env.reread({"LIVE_KEY", "MY_KEY", "EMPTY_KEY"})
+    assert out["error"] is None
+    assert out["differences"] == [
+        {"name": "EMPTY_KEY", "launch": "unset", "shell": "set", "where": ["~/.zshrc line 9"]},
+        {"name": "LIVE_KEY", "launch": "set", "shell": "unset", "where": []},
+    ]
+    assert "direnv-only" not in str(out) and "same-everywhere" not in str(out)  # never values
+    assert os.environ["LIVE_KEY"] == "direnv-only-1234567890" and "EMPTY_KEY" not in os.environ
+    assert env.shell_value("EMPTY_KEY") == "x"
+    assert env.info()["reread_at"] and env.info()["differences"] == out["differences"]
+
+
+def test_shell_reading_can_be_turned_off(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import settings_web_env as live
+
+    monkeypatch.setattr(live, "login_shell_env", lambda: pytest.fail("shell read while turned off"))
+    env = live.LiveEnv()
+    assert "turned off" in (env.reread({"HOME"})["error"] or "")
+    assert live.where_set("HOME") == []
 
 
 def _server(home: Path, tmp_path: Path):
     from types import SimpleNamespace
 
     from amplifier_app_cli import settings_web_env
+    from amplifier_app_cli.settings_web_system import Jobs
 
     proj = tmp_path / "proj" / ".amplifier"
     proj.mkdir(parents=True)
     settings = AppSettings(SettingsPaths(home / "settings.yaml", proj / "settings.yaml", proj / "settings.local.yaml"))
-    return SimpleNamespace(settings=settings, routing=RoutingService(settings), env=settings_web_env.LiveEnv())
+    return SimpleNamespace(settings=settings, routing=RoutingService(settings), env=settings_web_env.LiveEnv(), jobs=Jobs())
 
 
-def test_changes_poll_picks_up_keys_env(home: Path, tmp_path: Path) -> None:
-    from amplifier_app_cli import settings_web
+def test_changes_poll_never_runs_the_shell(home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import settings_web, settings_web_env
 
+    monkeypatch.delenv("AMPLIFIER_SETTINGS_SHELL_ENV")
+    monkeypatch.setattr(settings_web_env, "login_shell_env", lambda: pytest.fail("/api/changes ran the login shell"))
     server = _server(home, tmp_path)
     first = settings_web.changes(server, {})["fingerprint"]
     (home / "keys.env").write_text('MY_KEY="polled-1234567890"\n')

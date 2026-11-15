@@ -4,6 +4,7 @@ import { api, MASKED } from "../lib/api.js";
 import { h, btn, tag, field, textIn, switchRow, panel, kvEditor, plural, show, toast } from "../lib/dom.js";
 import { S, get, set, layered, providerName, providersIn, renumber, PLACEHOLDER, truthy, models, loadModels, paint, scopeNote, defaults, dirty, saveDraft } from "../lib/store.js";
 import { secretWidget, newKeyWidget, envName } from "../lib/secret.js";
+import { openDiagnose } from "../lib/diagnose.js";
 import { R, ensureRouting } from "./routing.js";
 
 const schemas = {};
@@ -83,6 +84,7 @@ function providerItem(p, i, ordered, commit, serves, inUseMatrix) {
         connTag,
         h("span", { class: "spacer" }),
         btn("Test connection", () => { delete models[name]; loadModels(name); paint(); }, { icon: "plug", small: true }),
+        btn("Diagnose", () => openDiagnose(name), { icon: "pulse", small: true }),
         btn(`Move ${name} up`, () => move(-1), { icon: "up", only: true, kind: "ghost", disabled: i === 0 }),
         btn(`Move ${name} down`, () => move(1), { icon: "down", only: true, kind: "ghost", disabled: i === ordered.length - 1 }),
         btn(`Remove ${name}`, () => { if (confirm(`Remove ${name}? Roles it serves fall back to the next model in their list.`)) commit(ordered.filter((x) => x !== p)); }, { icon: "trash", only: true, kind: "ghost danger" })),

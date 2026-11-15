@@ -1,8 +1,10 @@
 // Home, built for someone new: what's wrong and the button that fixes it, whether
 // each provider actually answers (checked on request, since it sends the key), the
-// and the few settings people change most.
-import { h, icon, btn, link, lamp, tag, field, panel, plural } from "../lib/dom.js";
+// few settings people change most, and upkeep.
+import { h, icon, btn, link, lamp, tag, field, panel, plural, fmtAgo } from "../lib/dom.js";
 import { S, getIn, setIn, layered, globalScope, providerName, providersIn, renumber, models, loadModels, quickSave, defaults } from "../lib/store.js";
+import { openDiagnose } from "../lib/diagnose.js";
+import { jobs, startJob, confirmUpdate, jobConsole, jobsOff } from "../lib/jobs.js";
 import { R, ensureRouting } from "./routing.js";
 import { warningList } from "./providers.js";
 import { notifyControls } from "./notifications.js";
@@ -22,6 +24,8 @@ export function attention() {
   }
   if (st.routing.missing) stop(`The routing matrix \`${st.routing.matrix}\` isn't on this machine.`, "routing", "Choose a matrix", "route");
   else if (st.routing.unserved?.length) out.push({ level: "wait", text: `${plural(st.routing.unserved.length, "role")} in ${st.routing.matrix} have no model you can use: ${st.routing.unserved.join(", ")}.`, go: "routing", action: "Fix routing", icon: "route" });
+  const every = st.updates.every_hours || defaults().update_check_hours;
+  if (st.updates.hours_ago === null || st.updates.hours_ago > every * 6) out.push({ level: "wait", text: st.updates.hours_ago === null ? "Amplifier has never checked for updates." : `Amplifier last checked for updates ${fmtAgo(st.updates.hours_ago)}.`, go: "update", action: "Check now", icon: "refresh" });
   return out;
 }
 
@@ -48,7 +52,8 @@ function connectionsPanel(st) {
         ok && ml.warnings?.length ? warningList(ml.warnings) : null),
       h("div", { class: "row-actions" },
         p.missing_keys.length ? link("Add key", "#keys", { icon: "key", kind: "small primary" })
-          : failed ? link("Fix the connection", "#providers", { icon: "plug", kind: "small primary" }) : null,
+          : failed ? btn("Diagnose", () => openDiagnose(p.name), { icon: "pulse", small: true, kind: "primary" }) : null,
+        ok ? btn(`Diagnose ${p.name}`, () => openDiagnose(p.name), { icon: "pulse", only: true, kind: "ghost" }) : null,
         p.missing_keys.length ? null : ml ? btn(`Check ${p.name} again`, () => checkProvider(p.name), { icon: "refresh", only: true, kind: "ghost", disabled: checking }) : btn("Check connection", () => checkProvider(p.name), { icon: "plug", small: true })));
   });
   return h("section", { class: "panel" },
@@ -77,6 +82,25 @@ function quickSettingsPanel(st) {
       field("Routing", h("select", { onchange: (e) => quickSave((d) => setIn(d, ["routing", "matrix"], e.target.value), `Now using ${e.target.value}.`) }, names.map((n) => h("option", { value: n, selected: n === current, text: n }))),
         routed.from && routed.from !== "global" ? `This project uses ${routed.val} instead (set in ${routed.from} settings).` : st.routing.missing ? "This matrix isn't on this machine." : `${st.routing.roles - st.routing.unserved.length} of ${plural(st.routing.roles, "role")} have a model. Open Routing to see which.`),
       notifyControls(g, (mutate) => quickSave(mutate))));
+}
+
+function maintenancePanel(st) {
+  const check = jobs["update-check"];
+  const run = jobs.update;
+  const off = jobsOff();
+  const busy = check?.running || run?.running;
+  const upd = st.updates;
+  return panel("Maintenance", null,
+    h("div", { class: "rows" },
+      h("div", { class: "row-item" }, icon("refresh"),
+        h("div", { class: "row-main" }, h("strong", { text: "Updates" }), h("div", { class: "hint", text: `Version ${st.version.display}. ${upd.hours_ago === null ? "Never checked." : `Checked ${fmtAgo(upd.hours_ago)}.`}` })),
+        h("div", { class: "row-actions" },
+          btn(check?.running ? "Checking…" : "Check", () => startJob("update-check"), { icon: "refresh", small: true, disabled: busy }),
+          btn(run?.running ? "Updating…" : "Update", confirmUpdate, { icon: "play", small: true, disabled: busy || off, title: off }))),
+      h("div", { class: "row-item" }, icon("undo"),
+        h("div", { class: "row-main" }, h("strong", { text: "Reset" }), h("div", { class: "hint", text: "Clear caches or start over. You choose what to keep, and preview it first." })),
+        h("div", { class: "row-actions" }, link("Reset…", "#reset", { icon: "undo", kind: "small" })))),
+    run || check ? h("div", { class: "pad" }, jobConsole(run || check)) : null);
 }
 
 function setupSteps() {
@@ -118,7 +142,7 @@ export default {
         top ? h("div", { class: "hero-actions" }, link(top.action, `#${top.go}`, { icon: top.icon, kind: "primary" })) : null),
       !st.providers.length ? setupSteps() : null,
       h("div", { class: "home-grid" },
-        h("div", { class: "col" }, connectionsPanel(st)),
+        h("div", { class: "col" }, connectionsPanel(st), maintenancePanel(st)),
         h("div", { class: "col" }, quickSettingsPanel(st), morePanel(st))),
     ];
   },

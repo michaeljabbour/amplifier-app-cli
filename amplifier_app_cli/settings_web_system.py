@@ -1,19 +1,31 @@
-"""Machine-level pieces of the settings page: keys, provider schemas, status.
+"""Machine-level pieces of the settings page: keys, provider schemas, status, jobs.
 
 * Key values are masked everywhere; one is revealed only on request.
 * Provider settings come only from the provider's own ConfigField declarations.
+* Update and reset run the real `amplifier update` / `amplifier reset` from a
+  fixed allow-list, in the server's working directory. They replace the program
+  serving the page, so they start detached and log to a private temp
+  folder made on the first job (not the Amplifier home: reset --full deletes it). AMPLIFIER_SETTINGS_JOBS=off turns them off.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import threading
+import time
+import uuid
 from datetime import datetime
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+from amplifier_foundation.paths.resolution import get_amplifier_home
 
+from .commands import reset as reset_cli
 from .lib.env_vars import ENV_PATTERN
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -35,6 +47,7 @@ def is_secret_value(field: Any, value: Any) -> bool:
 
 
 DEFAULT_MATRIX = "balanced"  # what `amplifier routing` falls back to (commands/routing.py)
+DEFAULT_NTFY_SERVER = "https://ntfy.sh"  # hooks-notify-push's default
 T = TypeVar("T")
 
 
@@ -52,6 +65,7 @@ def defaults() -> dict[str, Any]:
         "bundle": DEFAULT_BUNDLE,
         "update_check_hours": DEFAULT_SETTINGS["updates"]["check_frequency_hours"],
         "matrix": DEFAULT_MATRIX,
+        "ntfy_server": DEFAULT_NTFY_SERVER,
     }
 
 
@@ -130,6 +144,143 @@ def provider_schema(module_id: str) -> dict[str, Any]:
     return {"fields": fields, "origin": "provider" if fields else "none"}
 
 
+# ---------------------------------------------------------------- reset
+def _size(path: Path, budget_s: float = 4.0) -> int | None:
+    """Bytes under path; None if it takes too long to measure (shown as "large")."""
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total, start = 0, time.time()
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+        if time.time() - start > budget_s:
+            return None
+    return total
+
+
+def reset_info() -> dict[str, Any]:
+    """Reset's own categories, with sizes, plus what reset never touches."""
+    home = get_amplifier_home()
+    cats = []
+    for cat in reset_cli.CATEGORY_ORDER:
+        paths = [home / p for p in reset_cli.RESET_CATEGORIES[cat]]
+        sizes = [_size(p) for p in paths]
+        cats.append(
+            {
+                "name": cat,
+                "description": reset_cli.CATEGORY_DESCRIPTIONS[cat],
+                "exists": any(p.exists() for p in paths),
+                "bytes": None if None in sizes else sum(s or 0 for s in sizes),
+                "default_remove": cat in reset_cli.DEFAULT_REMOVE,
+            }
+        )
+    return {"categories": cats, "unmanaged": reset_cli.unmanaged_files(), "home": str(home)}
+
+
+# ---------------------------------------------------------------- jobs
+MUTATING = ("update", "reset")
+
+
+class Jobs:
+    """Runs allow-listed amplifier commands and keeps their output."""
+
+    def __init__(self, cwd: str | None = None) -> None:
+        self.cwd = cwd or os.getcwd()  # the server's directory, so update sees the project's bundles
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        # Outside the Amplifier home: `reset --full` deletes that home, including the
+        # log of the reset that is running. Created on the first job, not per launch.
+        self.log_dir: Path | None = None
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("AMPLIFIER_SETTINGS_JOBS", "").strip().lower() not in ("0", "off", "false", "no")
+
+    @property
+    def restart_required(self) -> bool:
+        """True once an update or reset has exited: the program serving this page may be gone."""
+        return any(j["mutating"] and j["proc"].poll() is not None for j in self._jobs.values())
+
+    def info(self) -> dict[str, Any]:
+        on = self.enabled()
+        return {"enabled": on, "reason": None if on else "Update and reset are turned off here (AMPLIFIER_SETTINGS_JOBS).", "restart_required": self.restart_required}
+
+    @staticmethod
+    def argv(kind: str, options: dict[str, Any]) -> list[str]:
+        if kind == "update-check":
+            args = ["update", "--check-only"]
+        elif kind == "update":
+            args = ["update", "-y"]
+        elif kind in ("reset-plan", "reset"):
+            remove = options.get("remove") if isinstance(options.get("remove"), list) else []
+            cats = [c for c in reset_cli.CATEGORY_ORDER if c in remove]
+            if options.get("full") is True:
+                args = ["reset", "--full"]
+            elif cats:
+                args = ["reset", "--remove", ",".join(cats)]  # --remove keeps everything else
+            else:
+                raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Choose at least one thing to reset.")
+            args += ["-y"] + (["--dry-run"] if kind == "reset-plan" else [])
+        else:
+            raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, f"Unknown action: {kind}")
+        return [sys.executable, "-m", "amplifier_app_cli", *args]
+
+    def start(self, kind: str, options: dict[str, Any]) -> dict[str, Any]:
+        mutating = kind in MUTATING
+        if mutating and not self.enabled():
+            raise SettingsError(HTTPStatus.FORBIDDEN, "Update and reset are turned off for this settings page. Run `amplifier update` or `amplifier reset` in a terminal.")
+        argv = self.argv(kind, options)
+        with self._lock:
+            if mutating and any(j["mutating"] and j["proc"].poll() is None for j in self._jobs.values()):
+                raise SettingsError(HTTPStatus.CONFLICT, "Another update or reset is still running.")
+            if kind == "reset":
+                plan = self._jobs.get(str(options.get("plan_id") or ""))
+                # the preview must be finished, clean, and for exactly this reset (argv minus --dry-run)
+                if not plan or plan["kind"] != "reset-plan" or plan["proc"].poll() != 0 or plan["argv"][:-1] != argv:
+                    raise SettingsError(HTTPStatus.CONFLICT, "Preview the reset first.")
+            if self.log_dir is None:
+                self.log_dir = Path(tempfile.mkdtemp(prefix="amplifier-settings-jobs-"))  # 0700
+            job_id = uuid.uuid4().hex[:12]
+            log = self.log_dir / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{job_id}.log"
+            env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "100", "PYTHONUNBUFFERED": "1"}
+            with open(log, "wb") as fh:
+                proc = subprocess.Popen(  # noqa: S603 -- argv comes from the allow-list above
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=self.cwd,
+                    start_new_session=mutating,  # survives this server being replaced
+                )
+            self._jobs[job_id] = {"proc": proc, "log": log, "started": time.time(), "mutating": mutating, "kind": kind, "argv": argv}
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> dict[str, Any]:
+        j = self._jobs.get(job_id)
+        if j is None:
+            raise SettingsError(HTTPStatus.NOT_FOUND, "That job isn't known to this settings page.")
+        code = j["proc"].poll()
+        try:
+            text = j["log"].read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        return {
+            "id": job_id,
+            "running": code is None,
+            "exit_code": code,
+            "output": text[-60_000:],
+            "log": str(j["log"]),
+            "command": "amplifier " + " ".join(j["argv"][3:]),
+            "seconds": round(time.time() - j["started"]),
+        }
+
+
 # ---------------------------------------------------------------- home status
 def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict[str, Any]) -> dict[str, Any]:
     """What the home page shows, from the same sources the CLI uses."""
@@ -188,3 +339,37 @@ def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict
         "bundle": {"active": bundle.get("active") or defaults()["bundle"], "always": len(bundle.get("app") or [])},
         "updates": {"hours_ago": hours_ago, "every_hours": upd.get("check_frequency_hours")},
     }
+
+
+# ---------------------------------------------------------------- phone test
+NTFY_TOPIC = "AMPLIFIER_NTFY_TOPIC"  # same variable `amplifier notify ntfy` uses
+
+
+def notify_test(merged: dict[str, Any]) -> dict[str, Any]:
+    """Send one test notification the way hooks-notify-push will (ntfy POST)."""
+    import urllib.error
+    import urllib.request
+
+    topic = os.environ.get(NTFY_TOPIC, "")  # the hook reads the topic from the environment only
+    if not topic:
+        raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Create a channel first.")
+    # The hook's order: its config `server` (ntfy over push, as the settings merge them), then
+    # AMPLIFIER_NTFY_SERVER, then its default.
+    cfg = (merged.get("config") or {}).get("notifications") or {}
+    configured = (cfg.get("ntfy") or {}).get("server") or (cfg.get("push") or {}).get("server")
+    server = str(configured or os.environ.get("AMPLIFIER_NTFY_SERVER", DEFAULT_NTFY_SERVER)).rstrip("/")
+    if not server.startswith(("http://", "https://")):
+        raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, f"The ntfy server must be an http(s) URL, not {server}.")
+    req = urllib.request.Request(
+        f"{server}/{topic}",
+        data="If you can read this, Amplifier can reach your phone.".encode(),
+        headers={"Title": "Amplifier test notification", "Tags": "white_check_mark"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 -- http(s) checked above
+            return {"ok": True, "status": r.status, "server": server}
+    except urllib.error.HTTPError as e:
+        raise SettingsError(HTTPStatus.BAD_GATEWAY, f"{server} answered {e.code}. Check the channel name and server.") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise SettingsError(HTTPStatus.BAD_GATEWAY, f"Couldn't reach {server}: {getattr(e, 'reason', e)}") from e

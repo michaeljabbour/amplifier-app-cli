@@ -26,6 +26,13 @@ from amplifier_app_cli.settings_web import (
 from amplifier_app_cli.settings_web_routing import RoutingService
 
 
+@pytest.fixture(autouse=True)
+def _no_shell_no_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never spawn the developer's login shell or a real update/reset from a test."""
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_SHELL_ENV", "off")
+    monkeypatch.setenv("AMPLIFIER_SETTINGS_JOBS", "off")
+
+
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     h = tmp_path / "home"
@@ -57,8 +64,9 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _srv(settings: AppSettings) -> SimpleNamespace:
     from amplifier_app_cli.settings_web_env import LiveEnv
+    from amplifier_app_cli.settings_web_system import Jobs
 
-    return SimpleNamespace(settings=settings, routing=RoutingService(settings), env=LiveEnv())
+    return SimpleNamespace(settings=settings, routing=RoutingService(settings), env=LiveEnv(), jobs=Jobs())
 
 
 def _state(settings: AppSettings) -> dict:
@@ -159,7 +167,7 @@ def test_state_masks_literal_secrets_and_save_puts_them_back(settings: AppSettin
     blob = json.dumps(st, default=str)
     assert "sk-literal" not in blob
     assert not {"effective", "cwd"} & st.keys() and "yaml" not in _global(st)
-    assert "defaults" in st.keys()
+    assert {"defaults", "env"} <= st.keys() and st["env"]["source"] == "launch"
     g = _global(st)
     assert g["masked"] == ["config.providers.0.config.api_key", "config.providers.1.config.api_key"]
     providers = g["doc"]["config"]["providers"]
@@ -310,15 +318,27 @@ def test_refused_request_body_never_becomes_a_request(server: SettingsServer, ho
     assert not (home / "keys.env").exists() or "SMUGGLED_PROOF" not in (home / "keys.env").read_text()
 
 
-def test_state_and_changes_never_run_a_shell(server: SettingsServer, monkeypatch: pytest.MonkeyPatch) -> None:
-    import subprocess
-
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("the page started a process"))
+def test_restart_required_answers_503_except_jobs(server: SettingsServer, monkeypatch: pytest.MonkeyPatch) -> None:
     ok = _session(server)
-    for path in ("/api/state", "/api/changes"):
+    from amplifier_app_cli.settings_web_system import Jobs
+
+    monkeypatch.setattr(Jobs, "restart_required", property(lambda self: True))
+    r, data = _req(server, "GET", "/api/state", ok)
+    assert r.status == 503 and json.loads(data)["restart"] is True
+    assert _req(server, "POST", "/api/key", ok, {"name": "A_KEY", "value": "x"})[0].status == 503
+    assert _req(server, "GET", "/api/jobs?id=nope", ok)[0].status == 404  # still answered
+
+
+def test_env_reread_is_explicit_and_can_be_off(server: SettingsServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    from amplifier_app_cli import settings_web_env
+
+    monkeypatch.setattr(settings_web_env, "login_shell_env", lambda: pytest.fail("shell read without a re-read"))
+    ok = _session(server)
+    for path in ("/api/state", "/api/state?fresh=1", "/api/changes"):
         assert _req(server, "GET", path, ok)[0].status == 200
-    for path in ("/api/jobs", "/api/env/reread", "/api/providers/diagnose", "/api/notify/test", "/api/routing/matrix"):
-        assert _req(server, "POST", path, ok, {})[0].status == 404  # not part of this page
+    assert _req(server, "POST", "/api/providers/diagnose", ok, {"name": "nope"})[0].status != 500
+    r, data = _req(server, "POST", "/api/env/reread", ok, {})
+    assert r.status == 200 and "turned off" in json.loads(data)["error"]
 
 
 def test_static_assets_ship_with_package() -> None:
