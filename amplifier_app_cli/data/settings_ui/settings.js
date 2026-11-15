@@ -213,15 +213,49 @@ async function refreshStatus() {
 async function load() {
   try {
     adopt(await api("/api/state"));
+    watchForChanges();
   } catch (e) {
     $("main").replaceChildren(h("p", { class: "notice stop", md: e.message }));
   }
 }
+
+// Settings files, keys.env and your shell environment can change while this page
+// is open (the CLI, an editor, ~/.secrets). Poll a fingerprint and catch up.
+const LIVE = { fingerprint: null, stale: false, timer: null };
+async function checkForChanges() {
+  if (document.visibilityState !== "visible") return;
+  let fp;
+  try { fp = (await api("/api/changes")).fingerprint; } catch { return; } // server gone: keep the page
+  if (LIVE.fingerprint === null || fp === LIVE.fingerprint) { LIVE.fingerprint = fp; return; }
+  const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+  if (dirty()) { LIVE.stale = true; renderMain(); return; } // never drop unsaved edits
+  if (typing) return; // try again on the next tick, after the field is left
+  LIVE.fingerprint = fp;
+  await reloadFromDisk("Updated: something changed outside this page.");
+}
+async function reloadFromDisk(message) {
+  try {
+    const next = await api("/api/state");
+    Object.assign(R, { models: {} });
+    LIVE.stale = false;
+    adopt(next);
+    if (R.matrices) refreshRouting({ matrices: true });
+    if (message) toast(message);
+  } catch (e) { toast(e.message); }
+}
+function watchForChanges() {
+  clearInterval(LIVE.timer);
+  LIVE.timer = setInterval(checkForChanges, 4000);
+  checkForChanges();
+}
+document.addEventListener("visibilitychange", checkForChanges);
+window.addEventListener("focus", checkForChanges);
 async function save() {
   $("save").disabled = true;
   try {
     const res = await api("/api/scope", { scope, doc: draft, version: cur().version });
     R.models = {};
+    LIVE.fingerprint = null;
     adopt(res);
     toast(`Saved ${SCOPES[scope][0].toLowerCase()} settings.`);
     for (const k of res.moved_keys || []) toast(`Moved a pasted key into keys.env as \`${k}\`.`);
@@ -274,6 +308,7 @@ async function quickSave(mutate, done = "Saved.") {
   try {
     const res = await api("/api/scope", { scope: "global", doc, version: g.version });
     R.models = {};
+    LIVE.fingerprint = null;
     adopt(res);
     toast(done);
     if (R.matrices) refreshRouting({});
@@ -383,10 +418,14 @@ function switchScope(name) {
 }
 function renderMain() {
   const s = cur();
+  const banner = LIVE.stale
+    ? h("div", { class: "notice wait" }, h("span", { text: "Settings changed outside this page while you were editing." }),
+        h("div", { class: "actions" }, btn("Load the new settings", () => reloadFromDisk("Loaded the new settings. Your unsaved edits were discarded."), { icon: "refresh", small: true }), btn("Keep editing", () => { LIVE.stale = false; renderMain(); }, { small: true, kind: "ghost" })))
+    : null;
   const kids = SCOPED.has(tab) && s.error && tab !== "file"
     ? [h("div", { class: "notice stop" }, h("p", {}, h("strong", { text: "This settings file can't be read, so editing is turned off. " }), s.error), link("Fix the file", "#file", { icon: "file" }))]
     : VIEWS[tab](s);
-  $("main").replaceChildren(...kids.flat().filter(Boolean));
+  $("main").replaceChildren(...[banner, ...kids].flat().filter(Boolean));
 }
 function rerenderOn(...tabs) {
   if (tabs.includes(tab)) renderMain();
@@ -1086,7 +1125,9 @@ VIEWS.keys = () => {
   };
   const vars = state.keys.filter((k) => !SECRET_NAME.test(k.name));
   return [
-    lede(`Saved in \`${state.home}/keys.env\`, which only you can read. Values are masked; use the eye to reveal one at a time.`),
+    lede(`Saved in \`${state.home}/keys.env\`, which only you can read. Values are masked; use the eye to reveal one at a time.`,
+      "Values exported by your shell (for example in `~/.secrets`) win over keys.env, exactly as when you run Amplifier. This page re-reads both every few seconds, so there's no need to restart it."),
+    state.env?.shell_error ? h("p", { class: "notice wait", text: state.env.shell_error }) : null,
     h("section", { class: "panel" }, state.keys.filter((k) => SECRET_NAME.test(k.name)).map(card), h("div", { class: "adder" }, nk, btn("Add a key", addKey, { icon: "plus" }))),
     vars.length ? panel("Other values your settings read", "Optional, like custom endpoints or context sizes. When one isn't set, the provider uses its default.", vars.map(card)) : null,
   ];

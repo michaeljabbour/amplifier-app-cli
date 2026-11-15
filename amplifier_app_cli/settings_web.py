@@ -41,6 +41,7 @@ from . import settings_web_system as system
 from .lib.settings import AppSettings, Scope
 from .provider_sources import DEFAULT_PROVIDER_SOURCES
 from .settings_web_diagnose import diagnose
+from .settings_web_env import LiveEnv
 from .settings_web_routing import RoutingService
 from .settings_web_system import SettingsError
 
@@ -283,7 +284,7 @@ def save_scope(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
         finally:
             provider_config_utils.console.quiet = quiet
     server.routing.refresh()  # providers may have changed: re-check model lists
-    return {**build_state(settings, server.routing), "moved_keys": moved}
+    return {**build_state(settings, server.routing), "env": server.env.info(), "moved_keys": moved}
 
 
 def save_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
@@ -297,7 +298,32 @@ def save_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
         raise SettingsError(HTTPStatus.UNPROCESSABLE_ENTITY, "Paste the key on its own: one line, no quotes.")
     KeyManager().save_key(name, value.strip())
     server.routing.refresh()  # a new key can make a provider's models listable
-    return build_state(server.settings, server.routing)
+    return {**build_state(server.settings, server.routing), "env": server.env.info()}
+
+
+def sync_env(server: SettingsServer, force: bool = False) -> None:
+    """Pick up keys.env and shell-profile changes made since launch (throttled)."""
+    docs = [read_doc(server.settings.get_scope_path(s))[0] for s in EDITABLE_SCOPES]
+    names = set().union(*(placeholders(d) for d in docs)) | {system.NTFY_TOPIC}
+    if server.env.refresh(names, force=force):
+        server.routing.refresh()  # values changed: model lists must be fetched again
+
+
+def state(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+    sync_env(server, force=q.get("fresh") == "1")
+    return {**build_state(server.settings, server.routing), "env": server.env.info()}
+
+
+def changes(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]:
+    """A fingerprint of everything the page shows; it polls this to stay current."""
+    sync_env(server)
+    parts = [file_version(server.settings.get_scope_path(s)) for s in EDITABLE_SCOPES]
+    parts.append(file_version(get_amplifier_home() / "keys.env"))
+    routing_dir = get_amplifier_home() / "routing"
+    if routing_dir.is_dir():
+        parts += [f"{f.name}:{f.stat().st_mtime_ns}" for f in sorted(routing_dir.glob("*.yaml"))]
+    parts.append(server.env.fingerprint)
+    return {"fingerprint": hashlib.sha256("|".join(parts).encode()).hexdigest()}
 
 
 def reveal_key(server: SettingsServer, body: dict[str, Any]) -> dict[str, Any]:
@@ -319,18 +345,19 @@ def provider_schema(server: SettingsServer, q: dict[str, str]) -> dict[str, Any]
 
 Handler = Callable[["SettingsServer", Any], dict[str, Any]]
 ROUTES: dict[tuple[str, str], Handler] = {
-    ("GET", "/api/state"): lambda s, q: build_state(s.settings, s.routing),
+    ("GET", "/api/state"): state,
+    ("GET", "/api/changes"): changes,
     ("GET", "/api/reset/categories"): lambda s, q: system.reset_info(),
     ("GET", "/api/provider-schema"): provider_schema,
     ("GET", "/api/jobs"): lambda s, q: s.jobs.get(q.get("id", "")),
     ("GET", "/api/routing/matrices"): lambda s, q: {"matrices": s.routing.matrices()},
-    ("GET", "/api/routing/models"): lambda s, q: s.routing.models(q.get("provider", "")),
+    ("GET", "/api/routing/models"): lambda s, q: (sync_env(s), s.routing.models(q.get("provider", "")))[1],
     ("POST", "/api/scope"): save_scope,
     ("POST", "/api/key"): save_key,
     ("POST", "/api/key/reveal"): reveal_key,
     ("POST", "/api/jobs"): lambda s, b: s.jobs.start(str(b.get("kind")), b.get("options") if isinstance(b.get("options"), dict) else {}),
     ("POST", "/api/notify/test"): lambda s, b: system.notify_test(s.settings.get_merged_settings()),
-    ("POST", "/api/providers/diagnose"): lambda s, b: diagnose(s.settings, str(b.get("name") or "")),
+    ("POST", "/api/providers/diagnose"): lambda s, b: (sync_env(s, force=True), diagnose(s.settings, str(b.get("name") or ""), s.env))[1],
     ("POST", "/api/routing/resolve"): lambda s, b: s.routing.resolve(str(b.get("matrix") or ""), b.get("overrides") or {}, bool(b.get("live"))),
     ("POST", "/api/routing/matrix"): lambda s, b: s.routing.save_matrix(b),
     ("POST", "/api/routing/matrix/delete"): lambda s, b: s.routing.delete_matrix(str(b.get("name") or "")),
@@ -429,6 +456,7 @@ class SettingsServer(ThreadingHTTPServer):
         self.settings = settings or AppSettings()
         self.routing = RoutingService(self.settings)
         self.jobs = system.Jobs()
+        self.env = LiveEnv()
         self.verbose = verbose
         self.launch_token = secrets.token_urlsafe(24)
         self.session = secrets.token_urlsafe(32)

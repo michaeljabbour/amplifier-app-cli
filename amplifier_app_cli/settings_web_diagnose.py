@@ -116,7 +116,7 @@ def _direct_call(url: str, style: str | None, key: str | None) -> dict[str, Any]
         return {"http": None, "seconds": round(time.monotonic() - started, 2), "message": "No answer within 15 seconds."}
 
 
-def diagnose(settings: AppSettings, name: str) -> dict[str, Any]:
+def diagnose(settings: AppSettings, name: str, live_env: Any = None) -> dict[str, Any]:
     started = time.monotonic()
     steps: list[dict[str, Any]] = []
     tips: list[str] = []
@@ -182,14 +182,20 @@ def diagnose(settings: AppSettings, name: str) -> dict[str, Any]:
             sources = []
             if file_val:
                 sources.append({"where": "keys.env", "preview": mask(file_val), "length": len(file_val)})
+            set_by: list[str] = []
             if env_val and env_val != file_val:
-                sources.append({"where": "your environment (shell or launchctl)", "preview": mask(env_val), "length": len(env_val)})
+                from .settings_web_env import where_set
+
+                set_by = where_set(var)
+                from_shell = live_env is not None and live_env.shell_value(var) == env_val
+                where = f"your shell ({', '.join(set_by)})" if set_by else "your shell startup files" if from_shell else "your environment (launchctl or the program that started this page)"
+                sources.append({"where": where, "preview": mask(env_val), "length": len(env_val)})
             used = env_val or file_val
             if not used:
                 steps.append(_step("API key", "fail", f"`{var}` is empty: it's not in keys.env or your environment.", variable=var, sources=sources))
                 tips.append(f"Add `{var}` on the API keys page.")
             elif env_val and file_val and env_val != file_val:
-                steps.append(_step("API key", "warn", f"`{var}` has two different values. Amplifier uses the one from your environment, because it never overrides an existing variable.", variable=var, sources=sources, used="your environment"))
+                steps.append(_step("API key", "warn", f"`{var}` has two different values. Amplifier uses the one from your environment, because it never overrides an existing variable.", variable=var, sources=sources, used="your environment", set_by=set_by))
                 candidates = [("from your environment (the one in use)", env_val), ("from keys.env", file_val)]
             else:
                 where = "keys.env" if file_val else "your environment"
@@ -212,7 +218,12 @@ def diagnose(settings: AppSettings, name: str) -> dict[str, Any]:
         elif first["http"] in (401, 403):
             summary = f"{url} rejected the key in use ({first['http']}): {first.get('message') or 'unauthorized'}"
         elif first["http"] == 404:
-            summary = f"{url} returned 404. The base URL is probably wrong."
+            root = _direct_call(base.split("/v1")[0].rstrip("/") + "/", None, None)
+            if root.get("http") == 404:
+                summary = f"{url} returned 404, and so does the server's root. Nothing is running behind this URL: the server, pod or tunnel is probably stopped."
+                first["nothing_running"] = True
+            else:
+                summary = f"{url} returned 404, but the server itself answers. The base URL path is probably wrong."
         elif first["http"]:
             summary = f"{url} answered {first['http']}: {first.get('message') or 'unexpected response'}"
         else:
@@ -220,9 +231,15 @@ def diagnose(settings: AppSettings, name: str) -> dict[str, Any]:
         steps.append(_step("Direct API check", status, summary, url=url, results=direct_results))
         if len(direct_results) > 1 and first["http"] in (401, 403) and any(r["http"] == 200 for r in direct_results[1:]):
             var = steps[2].get("variable", "the key")
-            tips.insert(0, f"The saved key in keys.env works; the one in your environment doesn't. Run `launchctl unsetenv {var}` (macOS), remove any `export {var}=` from your shell profile, open a new terminal, and restart `amplifier settings`.")
+            set_by = steps[2].get("set_by") or []
+            if set_by:
+                tips.insert(0, f"The saved key in keys.env works; the one set in {', '.join(set_by)} doesn't. Update or remove `export {var}=` there. This page picks the change up by itself within a few seconds.")
+            else:
+                tips.insert(0, f"The saved key in keys.env works; the one in your environment doesn't. Run `launchctl unsetenv {var}` (macOS), then restart `amplifier settings` from a new terminal.")
         elif first["http"] in (401, 403):
             tips.append("The provider rejected the key. Create a new key in the provider's dashboard and save it on the API keys page.")
+        elif first.get("nothing_running"):
+            tips.append("Start the server (or pod) again, or point this provider at one that's running. If its address changed, update the base URL.")
         elif first["http"] == 404:
             tips.append("Check the base URL on the Providers page; for OpenAI-compatible servers it usually ends in `/v1`.")
         elif first["http"] is None:

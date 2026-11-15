@@ -54,7 +54,9 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _srv(settings: AppSettings) -> SimpleNamespace:
-    return SimpleNamespace(settings=settings, routing=RoutingService(settings))
+    from amplifier_app_cli.settings_web_env import LiveEnv
+
+    return SimpleNamespace(settings=settings, routing=RoutingService(settings), env=LiveEnv())
 
 
 def _state(settings: AppSettings) -> dict:
