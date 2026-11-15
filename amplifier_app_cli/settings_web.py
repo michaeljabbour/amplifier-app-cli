@@ -438,6 +438,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 class SettingsServer(ThreadingHTTPServer):
     daemon_threads = True
+    # Browsers keep idle keep-alive connections open; joining their threads on
+    # shutdown would make Ctrl+C hang forever. They're daemon threads, so they
+    # end with the process.
+    block_on_close = False
 
     def __init__(self, port: int = 0, settings: AppSettings | None = None, verbose: bool = False) -> None:
         super().__init__(("127.0.0.1", port), _RequestHandler)

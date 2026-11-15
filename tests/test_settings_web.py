@@ -274,3 +274,21 @@ def test_static_assets_ship_with_package() -> None:
         for spec in re.findall(r"""from\s+["'](\.{1,2}/[^"']+)["']""", path.read_text()):
             todo.append(str((path.parent / spec).resolve().relative_to(ui.resolve())))
     assert "<script>" not in (ui / "settings.html").read_text()  # CSP: no inline script
+
+
+def test_shutdown_never_waits_for_idle_browser_connections(settings: AppSettings) -> None:
+    """Ctrl+C must stop the page even while a browser holds a keep-alive connection open."""
+    import socket
+    import time
+
+    srv = SettingsServer(port=0, settings=settings)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    idle = socket.create_connection(srv.server_address)  # a browser's idle keep-alive connection
+    idle.sendall(f"GET /favicon.ico HTTP/1.1\r\nHost: {srv.host_header}\r\n\r\n".encode())
+    idle.recv(4096)
+    started = time.monotonic()
+    srv.shutdown()
+    srv.server_close()
+    assert time.monotonic() - started < 2
+    idle.close()

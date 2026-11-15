@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import signal
 import webbrowser
 
 import click
 
 from ..console import console
+
+
+def _stop(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
 
 
 @click.command("settings")
@@ -44,6 +49,10 @@ def settings(port: int, no_browser: bool, verbose: bool) -> None:
     console.print("[dim]Press Ctrl+C to stop.[/dim]")
     if not no_browser:
         webbrowser.open(url)
+    # Ctrl+C must always stop the page, whatever handler something else installed;
+    # SIGTERM (e.g. `kill`) stops it the same way.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, _stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
