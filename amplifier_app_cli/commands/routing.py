@@ -104,7 +104,7 @@ def _ensure_routing_bundle_cached() -> None:
         console.print(f"[yellow]Could not fetch routing-matrix bundle: {e}[/yellow]")
 
 
-def _discover_matrix_files() -> list[Path]:
+def _discover_matrix_files(*, fetch: bool = True) -> list[Path]:
     """Discover available routing matrix YAML files.
 
     Looks in:
@@ -115,6 +115,11 @@ def _discover_matrix_files() -> list[Path]:
     fetches the routing-matrix bundle on first use. That makes `amplifier
     routing list` work out of the box instead of silently returning an
     empty list and telling the user to run a different command.
+
+    Pass ``fetch=False`` for a pure, offline filesystem scan: the bundle is
+    never fetched (no network, no console output) and only already-cached
+    and custom matrices are returned. Intended for non-interactive callers
+    (e.g. a settings UI) that must not block on, or trigger, a download.
     """
     files: list[Path] = []
 
@@ -125,7 +130,7 @@ def _discover_matrix_files() -> list[Path]:
         if cache_base.exists()
         else []
     )
-    if not bundle_dirs:
+    if not bundle_dirs and fetch:
         # First run on a clean install — fetch the bundle with visible feedback.
         # This can take 5-30s on a slow network so we must NOT block silently.
         console.print("[dim]Fetching routing-matrix bundle...[/dim]")
