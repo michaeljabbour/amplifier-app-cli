@@ -33,6 +33,11 @@ MAX_AGE_S = 8.0
 SHELL_TIMEOUT_S = 12.0
 
 
+def shell_env_enabled() -> bool:
+    """Sandboxes turn this off so a developer's real shell keys never leak in."""
+    return os.environ.get("AMPLIFIER_SETTINGS_SHELL_ENV", "").lower() not in ("0", "off", "false", "no")
+
+
 def login_shell_env() -> dict[str, str]:
     """Environment of a fresh login shell, as a new terminal tab would have it."""
     shell = os.environ.get("SHELL") or "/bin/zsh"
@@ -82,6 +87,8 @@ class LiveEnv:
                 return False
             self._checked = time.monotonic()
             try:
+                if not shell_env_enabled():
+                    raise RuntimeError("reading your login shell is turned off (AMPLIFIER_SETTINGS_SHELL_ENV=off)")
                 self._shell = login_shell_env()
                 self.shell_error, self.shell_read_at = None, time.time()
             except (OSError, subprocess.SubprocessError, RuntimeError) as e:
@@ -110,7 +117,7 @@ class LiveEnv:
 
 def where_set(name: str) -> list[str]:
     """Startup files (file:line) where a new login shell sets `name`. Values are never returned."""
-    if not NAME.match(name):
+    if not NAME.match(name) or not shell_env_enabled():
         return []
     shell = os.environ.get("SHELL") or "/bin/zsh"
     ps4 = "+%x:%I> " if shell.endswith("zsh") else "+${BASH_SOURCE}:${LINENO}> "

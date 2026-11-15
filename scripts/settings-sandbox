@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Try `amplifier settings` from this checkout against a throwaway Amplifier home.
+#
+#   scripts/settings-sandbox              reuse the sandbox (fast after the first run)
+#   scripts/settings-sandbox --copy       start from a copy of your real settings and routing;
+#                                         key names are kept, values become placeholders
+#   scripts/settings-sandbox --fresh      wipe the sandbox first
+#   scripts/settings-sandbox --real-keys  pass your shell's keys through (connection checks hit real APIs)
+#   Anything else is passed to `amplifier settings` (e.g. --no-browser --port 8770).
+#
+# The sandbox has its own Amplifier home AND its own Python environment, so it can't touch
+# ~/.amplifier or the environment your installed Amplifier uses. Location: $AMPLIFIER_SETTINGS_SANDBOX
+# (default ~/.cache/amplifier-settings-sandbox).
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+root="${AMPLIFIER_SETTINGS_SANDBOX:-$HOME/.cache/amplifier-settings-sandbox}"
+copy=0 fresh=0 real_keys=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --copy) copy=1 ;;
+    --fresh) fresh=1 ;;
+    --real-keys) real_keys=1 ;;
+    -h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) args+=("$a") ;;
+  esac
+done
+[ "$fresh" = 1 ] && rm -rf "$root"
+mkdir -p "$root/home"
+
+if [ "$copy" = 1 ]; then
+  real="${AMPLIFIER_HOME:-$HOME/.amplifier}"
+  [ -f "$real/settings.yaml" ] && cp "$real/settings.yaml" "$root/home/settings.yaml"
+  if [ -d "$real/routing" ]; then rm -rf "$root/home/routing"; cp -R "$real/routing" "$root/home/routing"; fi
+  mkdir -p "$root/home/cache"
+  for d in "$real"/cache/amplifier-bundle-routing-matrix-*; do [ -d "$d" ] && cp -R "$d" "$root/home/cache/"; done
+  if [ -f "$real/keys.env" ]; then
+    sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1="sandbox-placeholder"/' "$real/keys.env" > "$root/home/keys.env"
+    chmod 600 "$root/home/keys.env"
+  fi
+  echo "Copied your settings and routing into the sandbox (keys replaced with placeholders)."
+fi
+
+echo "Sandbox: $root  (its own Amplifier home and Python environment; ~/.amplifier is untouched)"
+cd "$repo"
+if [ "$real_keys" = 1 ]; then
+  exec env AMPLIFIER_HOME="$root/home" UV_PROJECT_ENVIRONMENT="$root/venv" \
+    uv run --project "$repo" amplifier settings ${args[@]+"${args[@]}"}
+fi
+# a clean environment: nothing exported by your shell (keys, base URLs) reaches the sandbox
+exec env -i HOME="$HOME" USER="${USER:-}" PATH="$PATH" TERM="${TERM:-xterm-256color}" LANG="${LANG:-en_US.UTF-8}" \
+  AMPLIFIER_HOME="$root/home" UV_PROJECT_ENVIRONMENT="$root/venv" AMPLIFIER_SETTINGS_SHELL_ENV=off \
+  uv run --project "$repo" amplifier settings ${args[@]+"${args[@]}"}
