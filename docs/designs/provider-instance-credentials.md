@@ -837,7 +837,47 @@ Bug-3-shaped failures through a different door.
 
 ---
 
+## 11a. Addendum: plaintext secrets in settings files and unresolvable modules
+
+Every provider write goes through `AppSettings._write_scope`, which calls
+`normalize_provider_secrets()` before the atomic write. For each provider entry
+it finds the secret `ConfigField` declared by the provider module, moves a
+literal value to `keys.env` and writes a `${VAR}` placeholder in its place. The
+name is the type default (e.g. `ANTHROPIC_API_KEY`) when it is free, otherwise
+`_suggest_instance_env_var()` (§5.4.2) against the cross-scope claimed set
+(§5.4.1). If no usable name exists, the `ValueError` propagates and the write is
+aborted with the old file untouched. `AppSettings.write_scope()` returns the
+names it moved, so a caller such as a settings UI can report them.
+
+**Unresolvable module (fallback).** When an entry's module can't be resolved (not
+installed, broken, or no `module` key at all), its declared secret field is
+unknown. Previously the scan was skipped with a warning and any literal stayed in
+the file. Now the scan falls back to field names: a config key matching
+`(^|_)(api_?key|key|token|secret|password|passphrase|credentials?)$`
+(case-insensitive) that holds a non-empty, non-`${VAR}` string is moved. So
+`api_key`, `apikey`, `access_token`, `client_secret`, `aws_secret_access_key`,
+`private_key`, `subscription_key` and `credentials` are moved, and `max_tokens`,
+`max_output_tokens` and `keyword` are not. Names are `<TYPE>_<FIELD>` (e.g.
+`FOO_ACCESS_TOKEN`) when free, otherwise `_suggest_instance_env_var()` with the
+field as suffix. An entry with no module name has no type default and is named
+`PROVIDER_<ID>_<FIELD>`.
+
+The fallback is best-effort and **never aborts a write**. Unlike the resolvable
+path, where the secret field is known and an unusable name is a real conflict to
+surface, an unresolvable entry is often stale config that has nothing to do with
+the write in progress (`set_active_bundle`, `routing use`, ...). If no usable
+name can be derived (e.g. the default is taken and the entry has no
+distinguishing id) or saving to `keys.env` fails, the value is left as it is,
+which is what happened before the fallback existed. The user is warned and told
+to move it by hand. Secret values are never printed.
+
+---
+
 ## 12. Revision history
+
+**Addendum (11a)** — documents plaintext-secret normalization on every provider
+write, the `write_scope()` return value, and the best-effort field-name fallback
+for unresolvable modules that never aborts a write.
 
 **v2 (this revision)** — incorporates the resolution of a 6-lens adversarial council
 review (intent-keeper, cranky-old-sam, crusty-old-engineer, restless-old-brian,

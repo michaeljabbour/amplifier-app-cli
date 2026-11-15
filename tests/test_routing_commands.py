@@ -672,8 +672,9 @@ def _seed_provider(settings: AppSettings, providers: list[dict]) -> None:
 
     Bypasses the plaintext-secret normalization that ``_write_scope`` now
     performs on every provider write (see
-    docs/designs/provider-instance-credentials.md addendum) by making the
-    provider module unresolvable for the duration of the seed write --
+    docs/designs/provider-instance-credentials.md addendum) by patching
+    ``normalize_provider_secrets`` out for the duration of the seed write
+    (an unresolvable module no longer skips the scan) --
     these tests seed literal config values purely for test setup and are
     not exercising secret-normalization behavior (that has its own
     dedicated coverage in test_provider_instance_credentials.py).
@@ -681,8 +682,7 @@ def _seed_provider(settings: AppSettings, providers: list[dict]) -> None:
     scope_settings = settings._read_scope("global")
     scope_settings["config"] = {"providers": providers}
     with patch(
-        "amplifier_app_cli.provider_config_utils.get_provider_info",
-        return_value=None,
+        "amplifier_app_cli.provider_config_utils.normalize_provider_secrets"
     ):
         settings._write_scope("global", scope_settings)
 
