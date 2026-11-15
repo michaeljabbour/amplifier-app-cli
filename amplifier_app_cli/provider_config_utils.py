@@ -578,7 +578,11 @@ def _claimed_env_vars(settings: AppSettings) -> set[str]:
 
 
 def _suggest_instance_env_var(
-    module_id: str, instance_id: str, claimed: set[str]
+    module_id: str,
+    instance_id: str,
+    claimed: set[str],
+    *,
+    field_suffix: str = "API_KEY",
 ) -> str:
     """``<TYPE_PREFIX>_<ID-SUFFIX>_API_KEY``, NFC-normalized then sanitized
     to ``^[A-Z_][A-Z0-9_]*$``, de-duplicated against ``claimed``. E.g.
@@ -591,6 +595,11 @@ def _suggest_instance_env_var(
     the identical suggestion and silently re-create the exact collision
     this fix exists to prevent. Must fail loudly here, never emit an
     invalid or re-colliding name.
+
+    ``field_suffix`` replaces the trailing ``API_KEY`` for secrets held in
+    a differently-named field (e.g. ``TOKEN`` for a ``token`` field) --
+    used only by the unresolvable-module fallback in
+    ``normalize_provider_secrets()``.
 
     See docs/designs/provider-instance-credentials.md §5.4.2.
     """
@@ -616,7 +625,7 @@ def _suggest_instance_env_var(
             "Please choose a more distinct id."
         )
 
-    suggested = f"{type_prefix}_{id_suffix}_API_KEY"
+    suggested = f"{type_prefix}_{id_suffix}_{field_suffix}"
     if suggested in claimed:
         raise ValueError(
             f"Instance id {instance_id!r} doesn't produce a usable "
@@ -625,6 +634,23 @@ def _suggest_instance_env_var(
             "distinct id."
         )
     return suggested
+
+
+# Field names treated as secrets when a provider entry's module can't be
+# resolved, so its declared secret ConfigField is unknown. Matches on the
+# END of the config key, case-insensitively: ``api_key``, ``azure_api_key``,
+# ``token``, ``access_token``, ``client_secret``, ``password``...
+_SECRET_FIELD_NAME_RE = re.compile(
+    r"(api_key|token|secret|password)$", re.IGNORECASE
+)
+
+
+def _looks_like_secret_field(name: Any) -> bool:
+    return isinstance(name, str) and bool(_SECRET_FIELD_NAME_RE.search(name))
+
+
+def _is_env_placeholder(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("${") and value.endswith("}")
 
 
 def normalize_provider_secrets(
@@ -647,6 +673,16 @@ def normalize_provider_secrets(
     undecided/possibly-colliding name -- ``_write_scope``'s atomic write
     hasn't run yet at that point, so the old scope file is untouched.
 
+    When an entry's module can't be resolved (not installed, broken, or no
+    ``module`` key at all), its declared secret field is unknown, so every
+    config key whose name ends in ``api_key``/``token``/``secret``/
+    ``password`` (case-insensitive) holding a non-empty, non-placeholder
+    string is treated as a secret instead. Names default to
+    ``<TYPE>_<FIELD>`` (e.g. ``FOO_API_KEY``) and otherwise fall back to
+    ``_suggest_instance_env_var`` with the field as suffix, de-duplicated
+    against the same claimed set -- an unresolvable module must never be a
+    way for a literal secret to reach settings.yaml.
+
     See docs/designs/provider-instance-credentials.md.
     """
     providers = (scope_settings.get("config") or {}).get("providers")
@@ -664,6 +700,99 @@ def normalize_provider_secrets(
     batch_claimed: set[str] = set()
     key_manager: KeyManager | None = None
 
+    def _move_to_keys_env(
+        entry: dict[str, Any],
+        field_id: str,
+        value: str,
+        *,
+        default_name: str | None,
+        naming_module_id: str,
+        entry_label: str,
+        field_suffix: str = "API_KEY",
+    ) -> None:
+        nonlocal claimed, key_manager
+        # Compute `claimed` now, on first use (see comment above
+        # `claimed`'s declaration).
+        if claimed is None:
+            claimed = _claimed_env_vars(settings_obj)
+        already_claimed = claimed | batch_claimed
+        if default_name and default_name not in already_claimed:
+            chosen = default_name
+        else:
+            chosen = _suggest_instance_env_var(
+                naming_module_id,
+                entry_label,
+                already_claimed,
+                field_suffix=field_suffix,
+            )
+
+        if key_manager is None:
+            key_manager = KeyManager()
+        key_manager.save_key(chosen, value)
+
+        entry["config"][field_id] = f"${{{chosen}}}"
+        batch_claimed.add(chosen)
+
+        message = (
+            f"Note: found a plaintext credential for instance "
+            f"'{entry_label}' \u2014 moved it to keys.env as {chosen}; "
+            f"settings now reference it by ${{{chosen}}}."
+        )
+        if scope == "project":
+            message += (
+                "  (project settings are team-shared/committed to git "
+                "\u2014 the secret is now only in keys.env, not in the "
+                "committed file.)"
+            )
+        console.print(message)
+
+    def _move_unresolved_entry_secrets(
+        entry: dict[str, Any],
+        module_label: str,
+        naming_module_id: str,
+        *,
+        type_default: bool = True,
+    ) -> None:
+        """Fallback for an entry whose module can't be resolved: scan its
+        config by field name (see ``_SECRET_FIELD_NAME_RE``)."""
+        raw_entry_id = entry.get("id")
+        entry_label = str(raw_entry_id) if raw_entry_id else naming_module_id
+        console.print(
+            f"[yellow]\u26a0 Could not resolve provider module "
+            f"'{escape(module_label)}' for entry "
+            f"'{escape(entry_label)}' -- its declared secret field is "
+            "unknown, so scanning for plaintext secrets by field name "
+            "instead (*api_key, *token, *secret, *password).[/yellow]"
+        )
+        entry_config = entry.get("config")
+        if not isinstance(entry_config, dict):
+            return
+        display = (
+            naming_module_id[9:]
+            if naming_module_id.startswith("provider-")
+            else naming_module_id
+        )
+        type_prefix = _sanitize_env_token(display)
+        for field_id, value in list(entry_config.items()):
+            if not _looks_like_secret_field(field_id):
+                continue
+            if not isinstance(value, str) or not value or _is_env_placeholder(value):
+                continue
+            field_suffix = _sanitize_env_token(field_id) or "API_KEY"
+            _move_to_keys_env(
+                entry,
+                field_id,
+                value,
+                default_name=(
+                    f"{type_prefix}_{field_suffix}"
+                    if type_default and type_prefix
+                    else None
+                ),
+                naming_module_id=naming_module_id,
+                entry_label=entry_label,
+                field_suffix=field_suffix,
+            )
+
     for entry in providers:
         if not isinstance(entry, dict):
             continue
@@ -671,13 +800,14 @@ def normalize_provider_secrets(
         raw_module_id = entry.get("module")
         raw_entry_id = entry.get("id")
 
-        if not isinstance(raw_module_id, str):
-            unresolved_label = raw_entry_id or raw_module_id
-            console.print(
-                f"[yellow]\u26a0 Could not resolve provider module "
-                f"'{escape(str(raw_module_id))}' for entry "
-                f"'{escape(str(unresolved_label))}' -- skipping "
-                "plaintext-secret scan for this entry.[/yellow]"
+        if not isinstance(raw_module_id, str) or not raw_module_id:
+            # No usable module name at all: name any secrets generically
+            # (PROVIDER_<ID>_<FIELD>) -- there is no type default to prefer.
+            _move_unresolved_entry_secrets(
+                entry,
+                str(raw_module_id),
+                naming_module_id="provider",
+                type_default=False,
             )
             continue
         module_id = raw_module_id
@@ -689,12 +819,8 @@ def normalize_provider_secrets(
         # don't get conflated into the same loud warning.
         provider_info = get_provider_info(module_id)
         if provider_info is None:
-            unresolved_label = raw_entry_id or module_id
-            console.print(
-                f"[yellow]\u26a0 Could not resolve provider module "
-                f"'{escape(module_id)}' for entry "
-                f"'{escape(str(unresolved_label))}' -- skipping "
-                "plaintext-secret scan for this entry.[/yellow]"
+            _move_unresolved_entry_secrets(
+                entry, module_id, naming_module_id=module_id
             )
             continue
         entry_label: str = str(raw_entry_id) if raw_entry_id else module_id
@@ -718,40 +844,18 @@ def normalize_provider_secrets(
         value = entry_config.get(field_id)
         if not value:
             continue
-        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        if _is_env_placeholder(value):
             continue
 
-        # A literal secret was found -- move it to keys.env. Compute
-        # `claimed` now, on first use (see comment above `claimed`'s
-        # declaration).
-        if claimed is None:
-            claimed = _claimed_env_vars(settings_obj)
-        already_claimed = claimed | batch_claimed
-        default_name = _secret_env_var_for(module_id)
-        if default_name and default_name not in already_claimed:
-            chosen = default_name
-        else:
-            chosen = _suggest_instance_env_var(module_id, entry_label, already_claimed)
-
-        if key_manager is None:
-            key_manager = KeyManager()
-        key_manager.save_key(chosen, value)
-
-        entry["config"][field_id] = f"${{{chosen}}}"
-        batch_claimed.add(chosen)
-
-        message = (
-            f"Note: found a plaintext credential for instance "
-            f"'{entry_label}' \u2014 moved it to keys.env as {chosen}; "
-            f"settings now reference it by ${{{chosen}}}."
+        # A literal secret was found -- move it to keys.env.
+        _move_to_keys_env(
+            entry,
+            field_id,
+            value,
+            default_name=_secret_env_var_for(module_id),
+            naming_module_id=module_id,
+            entry_label=entry_label,
         )
-        if scope == "project":
-            message += (
-                "  (project settings are team-shared/committed to git "
-                "\u2014 the secret is now only in keys.env, not in the "
-                "committed file.)"
-            )
-        console.print(message)
 
 
 def _prompt_for_field(

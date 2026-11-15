@@ -70,20 +70,38 @@ class KeyManager:
         scope's config references it via a ``${VAR}`` placeholder -- see
         docs/designs/provider-instance-credentials.md §5.4.1.
         """
+        return set(self._read_stored())
+
+    def get_stored(self, key_name: str) -> str | None:
+        """Return the value saved for ``key_name`` in the on-disk
+        ``keys.env`` store, or ``None`` if it isn't stored there.
+
+        Independent of ``os.environ``: a shell-exported variable that was
+        never written to ``keys.env`` returns ``None``, and a stored value
+        is returned even when the environment holds a different one. Uses
+        the same advisory lock and line parsing as ``stored_keys()``; the
+        surrounding quotes ``save_key()`` adds are stripped, matching what
+        ``_load_keys()`` exports into the environment.
+        """
+        return self._read_stored().get(key_name)
+
+    def _read_stored(self) -> dict[str, str]:
+        """Parse ``keys.env`` into ``{name: value}`` under the advisory
+        lock. Returns ``{}`` if the file is missing or unreadable."""
         if not self.keys_file.exists():
-            return set()
-        names: set[str] = set()
+            return {}
+        stored: dict[str, str] = {}
         with self._lock:
             try:
                 with open(self.keys_file, encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#") and "=" in line:
-                            k, _v = line.split("=", 1)
-                            names.add(k.strip())
+                            k, v = line.split("=", 1)
+                            stored[k.strip()] = v.strip().strip('"').strip("'")
             except Exception:
-                return set()
-        return names
+                return {}
+        return stored
 
     def save_key(self, key_name: str, key_value: str) -> None:
         """Save API key to keys.env file securely.

@@ -54,6 +54,40 @@ def no_live_model_listing():
         yield
 
 
+# The real Amplifier home as resolved before any test patches HOME,
+# Path.home() or AMPLIFIER_HOME.
+from amplifier_foundation.paths.resolution import (  # noqa: E402
+    get_amplifier_home as _real_get_amplifier_home,
+)
+
+_REAL_AMPLIFIER_HOME = _real_get_amplifier_home()
+
+
+@pytest.fixture(autouse=True)
+def keys_env_never_real(tmp_path_factory):
+    """KeyManager must never read or write the developer's real
+    ``~/.amplifier/keys.env`` from a unit test.
+
+    ``normalize_provider_secrets()`` moves literal provider secrets into
+    keys.env on every provider write -- including entries whose module
+    can't be resolved -- so any test that writes a provider entry with a
+    literal ``api_key`` without isolating its home would otherwise append
+    test values to the real store. Tests that DO isolate (``Path.home``,
+    ``HOME`` or ``AMPLIFIER_HOME``) are unaffected; only a resolution that
+    lands on the real home is redirected to a per-test temp dir. Private
+    MonkeyPatch for the same reason as ``no_live_model_listing`` above.
+    """
+    fallback = tmp_path_factory.mktemp("amplifier_home")
+
+    def _guarded() -> Path:
+        home = _real_get_amplifier_home()
+        return fallback if home == _REAL_AMPLIFIER_HOME else home
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("amplifier_app_cli.key_manager.get_amplifier_home", _guarded)
+        yield
+
+
 @pytest.fixture(autouse=True)
 def reset_skill_shortcuts():
     """Clear SKILL_SHORTCUTS before and after every test in this suite."""

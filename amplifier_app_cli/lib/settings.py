@@ -1183,6 +1183,45 @@ class AppSettings:
             raise ValueError(f"Unknown scope: {scope}")
         return path
 
+    # ----- Public scope I/O -----
+    #
+    # Stable public wrappers over the private per-scope helpers below, for
+    # callers outside this module (e.g. a settings UI) that need raw
+    # read-modify-write access to one scope's settings file. Locking
+    # contract: hold ``scope_lock(scope)`` for the WHOLE read-modify-write,
+    # not just the write::
+    #
+    #     with settings.scope_lock("global"):
+    #         data = settings.read_scope("global")
+    #         data.setdefault("config", {})["key"] = "value"
+    #         settings.write_scope("global", data)
+    #
+    # The lock is a non-reentrant ``filelock.FileLock`` per scope file;
+    # ``read_scope``/``write_scope`` do not take it themselves.
+
+    def read_scope(self, scope: Scope) -> dict[str, Any]:
+        """Return the raw settings dict stored at ``scope`` (``{}`` if the
+        file is missing or unparseable). Not merged with other scopes.
+
+        Raises ``ValueError`` for an unavailable scope (e.g. ``session``
+        without a session id).
+        """
+        return self._read_scope(scope)
+
+    def write_scope(self, scope: Scope, settings: dict[str, Any]) -> None:
+        """Atomically replace ``scope``'s settings file with ``settings``.
+
+        Literal provider secrets are moved to ``keys.env`` first (see
+        ``_write_scope``), so ``settings`` may be mutated in place. Callers
+        doing read-modify-write must hold ``scope_lock(scope)`` throughout.
+        """
+        self._write_scope(scope, settings)
+
+    def scope_lock(self, scope: Scope) -> BaseFileLock:
+        """Advisory file lock for ``scope``'s settings file; use as a
+        context manager around the full read-modify-write sequence."""
+        return self._scope_lock(scope)
+
     def _read_scope(self, scope: Scope) -> dict[str, Any]:
         """Read settings from a specific scope."""
         path = self._get_scope_path(scope)

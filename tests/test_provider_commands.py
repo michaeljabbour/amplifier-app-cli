@@ -32,8 +32,9 @@ def _seed_provider(
 
     Bypasses the plaintext-secret normalization that ``_write_scope`` now
     performs on every provider write (see
-    docs/designs/provider-instance-credentials.md addendum) by making the
-    provider module unresolvable for the duration of the seed write --
+    docs/designs/provider-instance-credentials.md addendum) by patching
+    ``normalize_provider_secrets`` out for the duration of the seed write
+    (an unresolvable module no longer skips the scan) --
     these tests seed literal config values purely for test setup and are
     not exercising secret-normalization behavior (that has its own
     dedicated coverage in test_provider_instance_credentials.py).
@@ -45,8 +46,7 @@ def _seed_provider(
     if provider_id is not None:
         entry["id"] = provider_id
     with patch(
-        "amplifier_app_cli.provider_config_utils.get_provider_info",
-        return_value=None,
+        "amplifier_app_cli.provider_config_utils.normalize_provider_secrets"
     ):
         settings.set_provider_override(entry, scope="global")
 
@@ -885,8 +885,7 @@ class TestProviderEditMultiInstance:
             }
         }
         with patch(
-            "amplifier_app_cli.provider_config_utils.get_provider_info",
-            return_value=None,
+            "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
         ):
             settings._write_scope("global", scope_data)
 
@@ -920,8 +919,7 @@ class TestProviderEditMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             result = runner.invoke(provider, ["edit", "anthropic"])
@@ -977,8 +975,7 @@ class TestProviderEditMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             result = runner.invoke(provider, ["edit", "wrong-instance"])
@@ -1028,8 +1025,7 @@ class TestProviderEditMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             result = runner.invoke(provider, ["edit", "anthropic"])
@@ -1111,8 +1107,7 @@ class TestManageEditProviderMultiInstance:
             }
         }
         with patch(
-            "amplifier_app_cli.provider_config_utils.get_provider_info",
-            return_value=None,
+            "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
         ):
             settings._write_scope("global", scope_data)
 
@@ -1161,8 +1156,7 @@ class TestManageEditProviderMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             _manage_edit_provider(settings, "e1", providers, scope="global")
@@ -1217,8 +1211,7 @@ class TestManageEditProviderMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             _manage_edit_provider(settings, "e1", providers, scope="global")
@@ -1265,8 +1258,7 @@ class TestManageEditProviderMultiInstance:
         # see docs/designs/provider-instance-credentials.md addendum; this
         # test is about write-back entry identity, not secret handling.
         with patch(
-            "amplifier_app_cli.provider_config_utils.get_provider_info",
-            return_value=None,
+            "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
         ):
             settings._write_scope("global", scope_data)
 
@@ -1288,8 +1280,7 @@ class TestManageEditProviderMultiInstance:
             ),
             patch("amplifier_app_cli.commands.provider.KeyManager"),
             patch(
-                "amplifier_app_cli.provider_config_utils.get_provider_info",
-                return_value=None,
+                "amplifier_app_cli.provider_config_utils.normalize_provider_secrets",
             ),
         ):
             _manage_edit_provider(settings, f"e{idx}", providers, scope="global")

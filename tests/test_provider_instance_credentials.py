@@ -2181,11 +2181,12 @@ class TestPlaintextSecretNormalization:
         providers = settings.get_scope_provider_overrides("global")
         assert providers[0]["config"]["api_key"] == "${ANTHROPIC_API_KEY}"
 
-    def test_unloadable_module_warns_and_skips_other_entries_still_processed(
+    def test_unloadable_module_warns_and_still_normalizes_by_field_name(
         self, tmp_path, monkeypatch
     ):
         """An entry for a module whose info can't load must warn loudly,
-        leave that entry's literal as-is, not crash, and NOT block
+        not crash, still move its secret-looking literal (by field name) to
+        keys.env -- never leave plaintext in settings.yaml -- and NOT block
         processing of other entries in the same batch."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         settings = _make_settings(tmp_path)
@@ -2232,8 +2233,11 @@ class TestPlaintextSecretNormalization:
         providers = settings.get_scope_provider_overrides("global")
         by_id = {p["id"]: p for p in providers}
 
-        # Unresolvable entry's literal is left as-is -- no crash.
-        assert by_id["vanished-1"]["config"]["api_key"] == "sk-literal-unresolvable"
+        # Unresolvable entry's literal is still moved out -- no crash.
+        assert by_id["vanished-1"]["config"]["api_key"] == (
+            "${UNKNOWN_VANISHED_API_KEY}"
+        )
+        assert by_id["vanished-1"]["config"]["default_model"] == "x"
 
         # The other entry in the same batch was still processed.
         fine_key = by_id["anthropic-fine"]["config"]["api_key"]
