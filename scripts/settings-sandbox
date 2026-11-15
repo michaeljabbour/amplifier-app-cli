@@ -35,9 +35,9 @@ if [ "$copy" = 1 ]; then
   mkdir -p "$root/home/cache"
   for d in "$real"/cache/amplifier-bundle-routing-matrix-*; do [ -d "$d" ] && cp -R "$d" "$root/home/cache/"; done
   if [ -f "$real/keys.env" ]; then
-    # secrets (names ending KEY/TOKEN/SECRET/PASSWORD) become placeholders; plain values such as
+    # secrets (names ending KEY/TOKEN/SECRET/PASSWORD/TOPIC) become placeholders; plain values such as
     # base URLs and context sizes are copied, so providers point at the right servers
-    sed -E 's/^([A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD))=.*/\1="sandbox-placeholder"/I' "$real/keys.env" > "$root/home/keys.env"
+    sed -E 's/^([A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|TOPIC))=.*/\1="sandbox-placeholder"/I' "$real/keys.env" > "$root/home/keys.env"
     chmod 600 "$root/home/keys.env"
   fi
   echo "Copied your settings and routing into the sandbox (secret values replaced with placeholders)."
