@@ -30,15 +30,10 @@ from amplifier_foundation.paths.resolution import get_amplifier_home
 from .commands import reset as reset_cli
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SECRET_FIELD = re.compile(r"(api_key|token|secret|password)$", re.IGNORECASE)
+SECRET_FIELD = re.compile(r"(api_key|token|secret|password)$", re.IGNORECASE)  # config field names
+SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$", re.IGNORECASE)  # environment variable names
 PLACEHOLDER_ONLY = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
-# Top-level settings keys the CLI reads. Other keys are labelled "not read by
-# the Amplifier CLI" -- other Amplifier apps share the file and may read them.
-CLI_TOP_LEVEL_KEYS = {
-    "bundle", "config", "sources", "overrides", "modules", "routing",
-    "updates", "ui", "provider", "configurator", "agents",
-}  # fmt: skip
 
 
 class SettingsError(Exception):
@@ -300,7 +295,6 @@ def status(settings: Any, routing: Any, keys: list[dict[str, Any]], merged: dict
         "routing": route,
         "bundle": {"active": bundle.get("active") or "foundation", "always": len(bundle.get("app") or [])},
         "updates": {"hours_ago": hours_ago, "every_hours": upd.get("check_frequency_hours")},
-        "unread_top_level": sorted(k for k in merged if k not in CLI_TOP_LEVEL_KEYS),
     }
 
 

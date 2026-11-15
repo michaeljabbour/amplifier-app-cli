@@ -48,11 +48,8 @@ from .settings_web_system import SettingsError
 logger = logging.getLogger(__name__)
 
 UI_DIR = Path(__file__).parent / "data" / "settings_ui"
-STATIC = {
-    "/": ("settings.html", "text/html; charset=utf-8"),
-    "/settings.css": ("settings.css", "text/css; charset=utf-8"),
-    "/settings.js": ("settings.js", "text/javascript; charset=utf-8"),
-}
+ASSET = re.compile(r"^/((?:[a-z0-9_-]+/)*[a-z0-9_-]+\.(js|css|html))$")
+ASSET_TYPES = {"js": "text/javascript; charset=utf-8", "css": "text/css; charset=utf-8", "html": "text/html; charset=utf-8"}
 EDITABLE_SCOPES: tuple[Scope, ...] = ("global", "project", "local")
 PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 MAX_BODY = 1_000_000
@@ -159,6 +156,7 @@ def key_list(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 # different shell/launchctl value silently wins over the saved key
                 "shadowed": name in stored and bool(os.environ.get(name)) and os.environ[name] != stored[name],
                 "referenced": name in referenced,
+                "secret": bool(system.SECRET_NAME.search(name)),
                 "preview": system.mask(value) if value else None,
             }
         )
@@ -204,7 +202,6 @@ def build_state(settings: AppSettings, routing: RoutingService) -> dict[str, Any
         },
         "keys": keys,
         "status": status,
-        "cli_top_level_keys": sorted(system.CLI_TOP_LEVEL_KEYS),
         "known_providers": [{"module": m, "source": s} for m, s in sorted(DEFAULT_PROVIDER_SOURCES.items())],
     }
 
@@ -423,9 +420,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return self._send(HTTPStatus.SEE_OTHER, b"", "text/plain", {"Location": "/", "Set-Cookie": cookie})
         if not self._authed():
             return self._send(HTTPStatus.UNAUTHORIZED, b"Open the link printed by `amplifier settings` to use this page.", "text/plain; charset=utf-8")
-        if method == "GET" and url.path in STATIC:
-            name, ctype = STATIC[url.path]
-            return self._send(HTTPStatus.OK, (UI_DIR / name).read_bytes(), ctype)
+        asset = ASSET.match("/settings.html" if url.path == "/" else url.path) if method == "GET" else None
+        if asset and (UI_DIR / asset.group(1)).is_file():
+            return self._send(HTTPStatus.OK, (UI_DIR / asset.group(1)).read_bytes(), ASSET_TYPES[asset.group(2)])
         route = ROUTES.get((method, url.path))
         if route is None:
             return self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
